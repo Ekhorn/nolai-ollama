@@ -24,6 +24,7 @@ import (
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/fs/gguf"
+	"github.com/ollama/ollama/manifest"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/template"
@@ -282,11 +283,8 @@ func (m *Model) String() string {
 	return modelfile.String()
 }
 
-func GetManifest(mp ModelPath) (*Manifest, string, error) {
-	fp, err := mp.GetManifestPath()
-	if err != nil {
-		return nil, "", err
-	}
+func GetManifest(n model.Name) (*manifest.Manifest, string, error) {
+	fp := n.Filepath()
 
 	f, err := os.Open(fp)
 	if err != nil {
@@ -296,30 +294,30 @@ func GetManifest(mp ModelPath) (*Manifest, string, error) {
 
 	sha256sum := sha256.New()
 
-	var manifest Manifest
-	if err := json.NewDecoder(io.TeeReader(f, sha256sum)).Decode(&manifest); err != nil {
+	var manifestFile manifest.Manifest
+	if err := json.NewDecoder(io.TeeReader(f, sha256sum)).Decode(&manifestFile); err != nil {
 		return nil, "", err
 	}
 
-	return &manifest, hex.EncodeToString(sha256sum.Sum(nil)), nil
+	return &manifestFile, hex.EncodeToString(sha256sum.Sum(nil)), nil
 }
 
 func GetModel(name string) (*Model, error) {
-	mp := ParseModelPath(name)
-	manifest, digest, err := GetManifest(mp)
+	n := model.ParseName(name)
+	mf, err := manifest.ParseNamedManifest(n)
 	if err != nil {
 		return nil, err
 	}
 
-	model := &Model{
-		Name:      mp.GetFullTagname(),
-		ShortName: mp.GetShortTagname(),
-		Digest:    digest,
+	m := &Model{
+		Name:      n.String(),
+		ShortName: n.DisplayShortest(),
+		Digest:    mf.Digest(),
 		Template:  template.DefaultTemplate,
 	}
 
-	if manifest.Config.Digest != "" {
-		filename, err := GetBlobsPath(manifest.Config.Digest)
+	if mf.Config.Digest != "" {
+		filename, err := manifest.BlobsPath(mf.Config.Digest)
 		if err != nil {
 			return nil, err
 		}
@@ -330,15 +328,15 @@ func GetModel(name string) (*Model, error) {
 		}
 		defer configFile.Close()
 
-		if err := json.NewDecoder(configFile).Decode(&model.Config); err != nil {
+		if err := json.NewDecoder(configFile).Decode(&m.Config); err != nil {
 			return nil, err
 		}
 	}
 
 	readMainModelFlag := false
 
-	for _, layer := range manifest.Layers {
-		filename, err := GetBlobsPath(layer.Digest)
+	for _, layer := range mf.Layers {
+		filename, err := manifest.BlobsPath(layer.Digest)
 		if err != nil {
 			return nil, err
 		}
@@ -346,20 +344,20 @@ func GetModel(name string) (*Model, error) {
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.model":
 			if !readMainModelFlag {
-				model.ModelPath = filename
-				model.ParentModel = layer.From
+				m.ModelPath = filename
+				m.ParentModel = layer.From
 				readMainModelFlag = true
 			} else {
-				model.ExtraModelPaths = append(model.ExtraModelPaths, filename)
+				m.ExtraModelPaths = append(m.ExtraModelPaths, filename)
 			}
 		case "application/vnd.ollama.image.embed":
 			// Deprecated in versions  > 0.1.2
 			// TODO: remove this warning in a future version
 			slog.Info("WARNING: model contains embeddings, but embeddings in modelfiles have been deprecated and will be ignored.")
 		case "application/vnd.ollama.image.adapter":
-			model.AdapterPaths = append(model.AdapterPaths, filename)
+			m.AdapterPaths = append(m.AdapterPaths, filename)
 		case "application/vnd.ollama.image.projector":
-			model.ProjectorPaths = append(model.ProjectorPaths, filename)
+			m.ProjectorPaths = append(m.ProjectorPaths, filename)
 		case "application/vnd.ollama.image.prompt",
 			"application/vnd.ollama.image.template":
 			bts, err := os.ReadFile(filename)
@@ -367,7 +365,7 @@ func GetModel(name string) (*Model, error) {
 				return nil, err
 			}
 
-			model.Template, err = template.Parse(string(bts))
+			m.Template, err = template.Parse(string(bts))
 			if err != nil {
 				return nil, err
 			}
@@ -377,7 +375,7 @@ func GetModel(name string) (*Model, error) {
 				return nil, err
 			}
 
-			model.System = string(bts)
+			m.System = string(bts)
 		case "application/vnd.ollama.image.params":
 			params, err := os.Open(filename)
 			if err != nil {
@@ -386,7 +384,7 @@ func GetModel(name string) (*Model, error) {
 			defer params.Close()
 
 			// parse model options parameters into a map so that we can see which fields have been specified explicitly
-			if err = json.NewDecoder(params).Decode(&model.Options); err != nil {
+			if err = json.NewDecoder(params).Decode(&m.Options); err != nil {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.messages":
@@ -396,7 +394,7 @@ func GetModel(name string) (*Model, error) {
 			}
 			defer msgs.Close()
 
-			if err = json.NewDecoder(msgs).Decode(&model.Messages); err != nil {
+			if err = json.NewDecoder(msgs).Decode(&m.Messages); err != nil {
 				return nil, err
 			}
 		case "application/vnd.ollama.image.license":
@@ -404,11 +402,11 @@ func GetModel(name string) (*Model, error) {
 			if err != nil {
 				return nil, err
 			}
-			model.License = append(model.License, string(bts))
+			m.License = append(m.License, string(bts))
 		}
 	}
 
-	return model, nil
+	return m, nil
 }
 
 func CopyModel(src, dst model.Name) error {
@@ -423,7 +421,7 @@ func CopyModel(src, dst model.Name) error {
 		return nil
 	}
 
-	manifests, err := GetManifestPath()
+	manifests, err := manifest.Path()
 	if err != nil {
 		return err
 	}
@@ -452,7 +450,7 @@ func CopyModel(src, dst model.Name) error {
 
 func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 	// Ignore corrupt manifests to avoid blocking deletion of layers that are freshly orphaned
-	manifests, err := Manifests(true)
+	manifests, err := manifest.Manifests(true)
 	if err != nil {
 		return err
 	}
@@ -467,7 +465,7 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 
 	// only delete the files which are still in the deleteMap
 	for k := range deleteMap {
-		fp, err := GetBlobsPath(k)
+		fp, err := manifest.BlobsPath(k)
 		if err != nil {
 			slog.Info(fmt.Sprintf("couldn't get file path for '%s': %v", k, err))
 			continue
@@ -483,7 +481,7 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 
 func PruneLayers() error {
 	deleteMap := make(map[string]struct{})
-	p, err := GetBlobsPath("")
+	p, err := manifest.BlobsPath("")
 	if err != nil {
 		return err
 	}
@@ -498,9 +496,9 @@ func PruneLayers() error {
 		name := blob.Name()
 		name = strings.ReplaceAll(name, "-", ":")
 
-		_, err := GetBlobsPath(name)
+		_, err := manifest.BlobsPath(name)
 		if err != nil {
-			if errors.Is(err, ErrInvalidDigestFormat) {
+			if errors.Is(err, manifest.ErrInvalidDigestFormat) {
 				// remove invalid blobs (e.g. partial downloads)
 				if err := os.Remove(filepath.Join(p, blob.Name())); err != nil {
 					slog.Error("couldn't remove blob", "blob", blob.Name(), "error", err)
@@ -559,29 +557,29 @@ func PruneDirectory(path string) error {
 }
 
 func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
-	mp := ParseModelPath(name)
+	n := model.ParseName(name)
 	fn(api.ProgressResponse{Status: "retrieving manifest"})
 
-	if mp.ProtocolScheme == "http" && !regOpts.Insecure {
+	if n.ProtocolScheme == "http" && !regOpts.Insecure {
 		return errInsecureProtocol
 	}
 
-	manifest, _, err := GetManifest(mp)
+	mf, err := manifest.ParseNamedManifest(n)
 	if err != nil {
 		fn(api.ProgressResponse{Status: "couldn't retrieve manifest"})
 		return err
 	}
 
-	var layers []Layer
-	layers = append(layers, manifest.Layers...)
-	if manifest.Config.Digest != "" {
-		layers = append(layers, manifest.Config)
+	var layers []manifest.Layer
+	layers = append(layers, mf.Layers...)
+	if mf.Config.Digest != "" {
+		layers = append(layers, mf.Config)
 	}
 
 	// Use fast transfer for models with tensor layers (many small blobs)
 	if hasTensorLayers(layers) {
 		// Read raw manifest JSON to preserve tensor metadata fields
-		manifestPath, err := mp.GetManifestPath()
+		manifestPath, err := manifest.PathForName(n)
 		if err != nil {
 			return err
 		}
@@ -589,7 +587,7 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		if err != nil {
 			return err
 		}
-		if err := pushWithTransfer(ctx, mp, layers, manifestJSON, regOpts, fn); err != nil {
+		if err := pushWithTransfer(ctx, n, layers, manifestJSON, regOpts, fn); err != nil {
 			return err
 		}
 		fn(api.ProgressResponse{Status: "success"})
@@ -597,17 +595,17 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	}
 
 	for _, layer := range layers {
-		if err := uploadBlob(ctx, mp, layer, regOpts, fn); err != nil {
+		if err := uploadBlob(ctx, n, layer, regOpts, fn); err != nil {
 			slog.Info(fmt.Sprintf("error uploading blob: %v", err))
 			return err
 		}
 	}
 
 	fn(api.ProgressResponse{Status: "pushing manifest"})
-	requestURL := mp.BaseURL()
-	requestURL = requestURL.JoinPath("v2", mp.GetNamespaceRepository(), "manifests", mp.Tag)
+	requestURL := n.BaseURL()
+	requestURL = requestURL.JoinPath("v2", n.DisplayNamespaceModel(), "manifests", n.Tag)
 
-	manifestJSON, err := json.Marshal(manifest)
+	manifestJSON, err := json.Marshal(mf)
 	if err != nil {
 		return err
 	}
@@ -626,44 +624,44 @@ func PushModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 }
 
 func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
-	mp := ParseModelPath(name)
+	n := model.ParseName(name)
 
 	// build deleteMap to prune unused layers
 	deleteMap := make(map[string]struct{})
-	manifest, _, err := GetManifest(mp)
+	existingMf, err := manifest.ParseNamedManifest(n)
 	if errors.Is(err, os.ErrNotExist) {
 		// noop
 	} else if err != nil {
 		slog.Warn("pulling model with bad existing manifest", "name", name, "error", err)
 	} else {
-		for _, l := range manifest.Layers {
+		for _, l := range existingMf.Layers {
 			deleteMap[l.Digest] = struct{}{}
 		}
-		if manifest.Config.Digest != "" {
-			deleteMap[manifest.Config.Digest] = struct{}{}
+		if existingMf.Config.Digest != "" {
+			deleteMap[existingMf.Config.Digest] = struct{}{}
 		}
 	}
 
-	if mp.ProtocolScheme == "http" && !regOpts.Insecure {
+	if n.ProtocolScheme == "http" && !regOpts.Insecure {
 		return errInsecureProtocol
 	}
 
 	fn(api.ProgressResponse{Status: "pulling manifest"})
 
-	manifest, err = pullModelManifest(ctx, mp, regOpts)
+	mf, err := pullModelManifest(ctx, n, regOpts)
 	if err != nil {
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
 
-	var layers []Layer
-	layers = append(layers, manifest.Layers...)
-	if manifest.Config.Digest != "" {
-		layers = append(layers, manifest.Config)
+	var layers []manifest.Layer
+	layers = append(layers, mf.Layers...)
+	if mf.Config.Digest != "" {
+		layers = append(layers, mf.Config)
 	}
 
 	// Use fast transfer for models with tensor layers (many small blobs)
 	if hasTensorLayers(layers) {
-		if err := pullWithTransfer(ctx, mp, layers, manifest, regOpts, fn); err != nil {
+		if err := pullWithTransfer(ctx, n, layers, mf, regOpts, fn); err != nil {
 			return err
 		}
 		fn(api.ProgressResponse{Status: "success"})
@@ -671,11 +669,11 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	}
 
 	skipVerify := make(map[string]bool)
-	isHF := isHuggingFaceRegistry(mp.Registry)
+	isHF := isHuggingFaceRegistry(n.Host)
 
 	for i, layer := range layers {
 		cacheHit, err := downloadBlob(ctx, downloadOpts{
-			mp:      mp,
+			n:       n,
 			digest:  layer.Digest,
 			regOpts: regOpts,
 			fn:      fn,
@@ -690,10 +688,10 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 				layer.Digest = realDigest.(string)
 				layers[i].Digest = realDigest.(string)
 				// Update the manifest layers
-				for j := range manifest.Layers {
-					if strings.HasPrefix(manifest.Layers[j].Digest, "hf:") {
-						if rd, ok := hfDigestMap.Load(manifest.Layers[j].Digest); ok {
-							manifest.Layers[j].Digest = rd.(string)
+				for j := range mf.Layers {
+					if strings.HasPrefix(mf.Layers[j].Digest, "hf:") {
+						if rd, ok := hfDigestMap.Load(mf.Layers[j].Digest); ok {
+							mf.Layers[j].Digest = rd.(string)
 						}
 					}
 				}
@@ -711,7 +709,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		}
 		if err := verifyBlob(layer.Digest); err != nil {
 			if errors.Is(err, errDigestMismatch) {
-				fp, err := GetBlobsPath(layer.Digest)
+				fp, err := manifest.BlobsPath(layer.Digest)
 				if err != nil {
 					return err
 				}
@@ -726,16 +724,16 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 	for _, layer := range layers {
 		delete(deleteMap, layer.Digest)
 	}
-	delete(deleteMap, manifest.Config.Digest)
+	delete(deleteMap, mf.Config.Digest)
 
 	fn(api.ProgressResponse{Status: "writing manifest"})
 
-	manifestJSON, err := json.Marshal(manifest)
+	manifestJSON, err := json.Marshal(mf)
 	if err != nil {
 		return err
 	}
 
-	fp, err := mp.GetManifestPath()
+	fp, err := manifest.PathForName(n)
 	if err != nil {
 		return err
 	}
@@ -762,9 +760,9 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 }
 
 // hasTensorLayers checks if any layer has tensor media type.
-func hasTensorLayers(layers []Layer) bool {
+func hasTensorLayers(layers []manifest.Layer) bool {
 	for _, layer := range layers {
-		if layer.MediaType == MediaTypeImageTensor {
+		if layer.MediaType == manifest.MediaTypeImageTensor {
 			return true
 		}
 	}
@@ -772,7 +770,7 @@ func hasTensorLayers(layers []Layer) bool {
 }
 
 // pullWithTransfer uses the simplified x/transfer package for downloading blobs.
-func pullWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifest *Manifest, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
+func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, mf *manifest.Manifest, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	blobs := make([]transfer.Blob, len(layers))
 	for i, layer := range layers {
 		blobs[i] = transfer.Blob{
@@ -781,12 +779,12 @@ func pullWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 		}
 	}
 
-	destDir, err := GetBlobsPath("")
+	destDir, err := manifest.BlobsPath("")
 	if err != nil {
 		return err
 	}
 
-	base := mp.BaseURL()
+	base := n.BaseURL()
 	if base.Scheme != "http" && regOpts != nil && regOpts.Insecure {
 		base.Scheme = "http"
 	}
@@ -818,7 +816,7 @@ func pullWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 		Blobs:      blobs,
 		BaseURL:    baseURL,
 		DestDir:    destDir,
-		Repository: mp.GetNamespaceRepository(),
+		Repository: n.DisplayNamespaceModel(),
 		Progress:   progress,
 		Token:      regOpts.Token,
 		GetToken:   getToken,
@@ -829,12 +827,12 @@ func pullWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 
 	// Write manifest
 	fn(api.ProgressResponse{Status: "writing manifest"})
-	manifestJSON, err := json.Marshal(manifest)
+	manifestJSON, err := json.Marshal(mf)
 	if err != nil {
 		return err
 	}
 
-	fp, err := mp.GetManifestPath()
+	fp, err := manifest.PathForName(n)
 	if err != nil {
 		return err
 	}
@@ -846,7 +844,7 @@ func pullWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 }
 
 // pushWithTransfer uses the simplified x/transfer package for uploading blobs and manifest.
-func pushWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifestJSON []byte, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
+func pushWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, manifestJSON []byte, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	blobs := make([]transfer.Blob, len(layers))
 	for i, layer := range layers {
 		blobs[i] = transfer.Blob{
@@ -856,12 +854,12 @@ func pushWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 		}
 	}
 
-	srcDir, err := GetBlobsPath("")
+	srcDir, err := manifest.BlobsPath("")
 	if err != nil {
 		return err
 	}
 
-	base := mp.BaseURL()
+	base := n.BaseURL()
 	if base.Scheme != "http" && regOpts != nil && regOpts.Insecure {
 		base.Scheme = "http"
 	}
@@ -898,18 +896,18 @@ func pushWithTransfer(ctx context.Context, mp ModelPath, layers []Layer, manifes
 		GetToken:    getToken,
 		Logger:      slog.Default(),
 		Manifest:    manifestJSON,
-		ManifestRef: mp.Tag,
-		Repository:  mp.GetNamespaceRepository(),
+		ManifestRef: n.Tag,
+		Repository:  n.DisplayNamespaceModel(),
 	})
 }
 
-func pullModelManifest(ctx context.Context, mp ModelPath, regOpts *registryOptions) (*Manifest, error) {
+func pullModelManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, error) {
 	// Check if this is a HuggingFace registry
-	if isHuggingFaceRegistry(mp.Registry) {
-		return pullHuggingFaceManifest(ctx, mp, regOpts)
+	if isHuggingFaceRegistry(n.Host) {
+		return pullHuggingFaceManifest(ctx, n, regOpts)
 	}
 
-	requestURL := mp.BaseURL().JoinPath("v2", mp.GetNamespaceRepository(), "manifests", mp.Tag)
+	requestURL := n.BaseURL().JoinPath("v2", n.DisplayNamespaceModel(), "manifests", n.Tag)
 
 	headers := make(http.Header)
 	headers.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
@@ -919,7 +917,7 @@ func pullModelManifest(ctx context.Context, mp ModelPath, regOpts *registryOptio
 	}
 	defer resp.Body.Close()
 
-	var m Manifest
+	var m manifest.Manifest
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 		return nil, err
 	}
@@ -945,14 +943,14 @@ type HFFileInfo struct {
 }
 
 // pullHuggingFaceManifest pulls a model manifest from HuggingFace
-func pullHuggingFaceManifest(ctx context.Context, mp ModelPath, regOpts *registryOptions) (*Manifest, error) {
+func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, error) {
 	// For HuggingFace, the tag might be "main" or could include a subdirectory like "BF16"
 	// We'll use "main" as the revision and the tag as the subdirectory filter
 	revision := "main"
-	subdirFilter := mp.Tag
+	subdirFilter := n.Tag
 
 	// Query HuggingFace API for file tree (always use main revision, recursive)
-	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/%s?recursive=true", mp.GetNamespaceRepository(), revision)
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/%s?recursive=true", n.DisplayNamespaceModel(), revision)
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
@@ -1010,9 +1008,9 @@ func pullHuggingFaceManifest(ctx context.Context, mp ModelPath, regOpts *registr
 	// Check if these are split GGUF files
 	shardSets, singles := parser.GroupGGUFShards(extractPaths(ggufFiles))
 
-	var manifest Manifest
-	manifest.SchemaVersion = 2
-	manifest.MediaType = "application/vnd.docker.distribution.manifest.v2+json"
+	var mf manifest.Manifest
+	mf.SchemaVersion = 2
+	mf.MediaType = "application/vnd.docker.distribution.manifest.v2+json"
 
 	// Handle split GGUF files
 	if len(shardSets) > 0 {
@@ -1034,7 +1032,7 @@ func pullHuggingFaceManifest(ctx context.Context, mp ModelPath, regOpts *registr
 			}
 
 			// Create a layer for this shard
-			layer := Layer{
+			layer := manifest.Layer{
 				MediaType: "application/vnd.ollama.image.model",
 				Size:      fileInfo.Size,
 				Digest:    "", // Will be computed during download
@@ -1042,9 +1040,9 @@ func pullHuggingFaceManifest(ctx context.Context, mp ModelPath, regOpts *registr
 
 			// Store the HuggingFace download URL in the layer
 			// We'll use the digest field temporarily to store the download path
-			layer.Digest = fmt.Sprintf("hf:%s/%s/%s", mp.GetNamespaceRepository(), mp.Tag, fileInfo.Path)
+			layer.Digest = fmt.Sprintf("hf:%s/%s/%s", n.DisplayNamespaceModel(), n.Tag, fileInfo.Path)
 
-			manifest.Layers = append(manifest.Layers, layer)
+			mf.Layers = append(mf.Layers, layer)
 		}
 	} else if len(singles) > 0 {
 		// Single GGUF file
@@ -1062,16 +1060,16 @@ func pullHuggingFaceManifest(ctx context.Context, mp ModelPath, regOpts *registr
 			return nil, fmt.Errorf("GGUF file info not found")
 		}
 
-		layer := Layer{
+		layer := manifest.Layer{
 			MediaType: "application/vnd.ollama.image.model",
 			Size:      fileInfo.Size,
-			Digest:    fmt.Sprintf("hf:%s/%s/%s", mp.GetNamespaceRepository(), mp.Tag, fileInfo.Path),
+			Digest:    fmt.Sprintf("hf:%s/%s/%s", n.DisplayNamespaceModel(), n.Tag, fileInfo.Path),
 		}
 
-		manifest.Layers = append(manifest.Layers, layer)
+		mf.Layers = append(mf.Layers, layer)
 	}
 
-	return &manifest, nil
+	return &mf, nil
 }
 
 // extractPaths extracts file paths from HFFileInfo slice
@@ -1237,7 +1235,7 @@ func parseRegistryChallenge(authStr string) registryChallenge {
 var errDigestMismatch = errors.New("digest mismatch, file must be downloaded again")
 
 func verifyBlob(digest string) error {
-	fp, err := GetBlobsPath(digest)
+	fp, err := manifest.BlobsPath(digest)
 	if err != nil {
 		return err
 	}
