@@ -82,15 +82,30 @@ RUN --mount=type=cache,target=/root/.ccache \
         && cmake --install build --component CUDA --strip
 
 
-FROM base AS rocm-7
+FROM --platform=linux/amd64 rocm/dev-almalinux-8:${ROCMVERSION}-complete AS base-rocm7
+RUN dnf install -y yum-utils ccache gcc-toolset-11-gcc gcc-toolset-11-gcc-c++ gcc-toolset-11-binutils \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf/* /var/lib/dnf/*.sqlite* /var/lib/dnf/history.* /tmp/*
+ENV PATH=/opt/rh/gcc-toolset-11/root/usr/bin:$PATH
+ARG CMAKEVERSION
+ARG NINJAVERSION
+RUN curl -fsSL https://github.com/Kitware/CMake/releases/download/v${CMAKEVERSION}/cmake-${CMAKEVERSION}-linux-$(uname -m).tar.gz | tar xz -C /usr/local --strip-components 1
+RUN dnf install -y unzip \
+    && curl -fsSL -o /tmp/ninja.zip https://github.com/ninja-build/ninja/releases/download/v${NINJAVERSION}/ninja-linux$([ "$(uname -m)" = "aarch64" ] && echo "-aarch64").zip \
+    && unzip /tmp/ninja.zip -d /usr/local/bin \
+    && rm /tmp/ninja.zip
+ENV CMAKE_GENERATOR=Ninja
+ENV LDFLAGS=-s
+
+FROM base-rocm7 AS rocm-7
 ENV PATH=/opt/rocm/hcc/bin:/opt/rocm/hip/bin:/opt/rocm/bin:/opt/rocm/hcc/bin:$PATH
 COPY CMakeLists.txt CMakePresets.json .
 COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake --preset 'ROCm 7' \
+    cmake --preset 'ROCm 7' -DOLLAMA_RUNNER_DIR="rocm_v7" \
         && cmake --build --preset 'ROCm 7' -- -l $(nproc) \
         && cmake --install build --component HIP --strip
-RUN rm -f dist/lib/ollama/rocm/rocblas/library/*gfx90[06]*
+RUN rm -f dist/lib/ollama/rocm_v7/rocblas/library/*gfx90[06]*
 
 FROM --platform=linux/arm64 nvcr.io/nvidia/l4t-jetpack:${JETPACK5VERSION} AS jetpack-5
 ARG CMAKEVERSION
@@ -225,4 +240,16 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV OLLAMA_HOST=0.0.0.0:11434
 EXPOSE 11434
 ENTRYPOINT ["/bin/ollama"]
+CMD ["serve"]
+
+FROM base-rocm7 AS rocm7-final
+COPY --from=build /bin/ollama /usr/bin/ollama
+COPY --from=cpu dist/lib/ollama /usr/lib/ollama
+COPY --from=rocm-7 dist/lib/ollama /usr/lib/ollama
+ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama
+ENV OLLAMA_HOST=0.0.0.0:11434
+RUN dnf clean all && \
+    rm -rf /var/cache/dnf/* /var/lib/dnf/*.sqlite* /var/lib/dnf/history.* /tmp/*
+EXPOSE 11434
+ENTRYPOINT ["/usr/bin/ollama"]
 CMD ["serve"]

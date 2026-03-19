@@ -78,6 +78,19 @@ var OnceLoad = sync.OnceFunc(func() {
 
 	libPaths = filepath.SplitList(paths)
 	visited := make(map[string]struct{}, len(libPaths))
+
+	loadPath := func(abspath string) {
+		if _, ok := visited[abspath]; !ok {
+			func() {
+				slog.Debug("ggml backend load all from path", "path", abspath)
+				cpath := C.CString(abspath)
+				defer C.free(unsafe.Pointer(cpath))
+				C.ggml_backend_load_all_from_path(cpath)
+			}()
+			visited[abspath] = struct{}{}
+		}
+	}
+
 	for _, path := range libPaths {
 		abspath, err := filepath.Abs(path)
 		if err != nil {
@@ -90,15 +103,19 @@ var OnceLoad = sync.OnceFunc(func() {
 			continue
 		}
 
-		if _, ok := visited[abspath]; !ok {
-			func() {
-				slog.Debug("ggml backend load all from path", "path", abspath)
-				cpath := C.CString(abspath)
-				defer C.free(unsafe.Pointer(cpath))
-				C.ggml_backend_load_all_from_path(cpath)
-			}()
+		loadPath(abspath)
 
-			visited[abspath] = struct{}{}
+		// Also load from subdirectories (e.g. rocm/, cuda/ subdirs within lib/ollama)
+		// ggml_backend_load_best only scans a single directory non-recursively, so
+		// GPU backends installed in subdirectories would otherwise not be found.
+		entries, err := os.ReadDir(abspath)
+		if err == nil {
+			for _, entry := range entries {
+				if entry.IsDir() {
+					subpath := filepath.Join(abspath, entry.Name())
+					loadPath(subpath)
+				}
+			}
 		}
 	}
 
