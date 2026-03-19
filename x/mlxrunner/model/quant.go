@@ -1,5 +1,3 @@
-//go:build mlx
-
 package model
 
 import (
@@ -17,8 +15,10 @@ func QuantizationParams(quantization string) (groupSize, bits int, mode string) 
 		return 32, 4, "affine"
 	case "MXFP8":
 		return 32, 8, "mxfp8"
-	case "FP8", "Q8", "INT8", "":
+	case "FP8", "Q8", "INT8":
 		return 64, 8, "affine"
+	case "":
+		return 0, 0, ""
 	default:
 		return 32, 8, "affine"
 	}

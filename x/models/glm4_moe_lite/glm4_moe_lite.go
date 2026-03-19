@@ -1,5 +1,3 @@
-//go:build mlx
-
 // Package glm4_moe_lite provides the GLM4-MoE-Lite implementation for MLX.
 // This model uses Multi-head Latent Attention (MLA) and Mixture of Experts (MoE).
 package glm4_moe_lite
@@ -347,7 +345,7 @@ type Block interface {
 
 // Model represents the complete GLM4-MoE-Lite model
 type Model struct {
-	EmbedTokens *nn.Embedding
+	EmbedTokens nn.EmbeddingLayer
 	Layers      []Block
 	Norm        *nn.RMSNorm
 	LMHead      nn.LinearLayer
@@ -588,9 +586,7 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	}
 
 	// Load embedding
-	if w := tensors["model.embed_tokens.weight"]; w != nil {
-		m.EmbedTokens = nn.NewEmbedding(w)
-	}
+	m.EmbedTokens = model.MakeEmbeddingLayer(tensors, "model.embed_tokens", cfg.QuantGroupSize, cfg.QuantBits, cfg.QuantMode, cfg.TensorQuant)
 
 	// Load final norm
 	if w := tensors["model.norm.weight"]; w != nil {
@@ -702,9 +698,6 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		}
 	}
 
-	collected := mlx.Collect(m)
-	mlx.Eval(collected...)
-
 	return nil
 }
 
@@ -736,7 +729,7 @@ func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
 func (m *Model) NumLayers() int { return len(m.Layers) }
 
 // MaxContextLength returns the maximum context length
-func (m *Model) MaxContextLength() int32 { return m.MaxPositionEmbeddings }
+func (m *Model) MaxContextLength() int { return int(m.MaxPositionEmbeddings) }
 
 // VocabSize returns the vocabulary size
 func (m *Model) VocabSize() int32 { return m.Config.VocabSize }

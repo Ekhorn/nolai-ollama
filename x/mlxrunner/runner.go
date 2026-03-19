@@ -1,18 +1,16 @@
-//go:build mlx
-
 package mlxrunner
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ollama/ollama/x/mlxrunner/cache"
+	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/x/mlxrunner/mlx"
 	"github.com/ollama/ollama/x/mlxrunner/model"
 	"github.com/ollama/ollama/x/mlxrunner/model/base"
@@ -22,46 +20,36 @@ import (
 
 type Request struct {
 	TextCompletionsRequest
-	Responses chan Response
+	Responses chan CompletionResponse
 	Pipeline  func(Request) error
 
-	sample.Sampler
-	caches []cache.Cache
+	Ctx context.Context
+
+	Sampler *sample.Sampler
 }
 
 type TextCompletionsRequest struct {
 	Prompt  string `json:"prompt"`
 	Options struct {
-		Temperature float32 `json:"temperature"`
-		TopP        float32 `json:"top_p"`
-		MinP        float32 `json:"min_p"`
-		TopK        int     `json:"top_k"`
-		MaxTokens   int     `json:"max_tokens"`
+		Temperature     float32 `json:"temperature"`
+		TopP            float32 `json:"top_p"`
+		MinP            float32 `json:"min_p"`
+		TopK            int     `json:"top_k"`
+		RepeatLastN     int     `json:"repeat_last_n"`
+		PresencePenalty float32 `json:"presence_penalty"`
+		MaxTokens       int     `json:"max_tokens"`
 
 		// Deprecated: use MaxTokens instead
 		NumPredict int `json:"num_predict"`
 	} `json:"options"`
 }
 
-type Response struct {
-	Text       string    `json:"content,omitempty"`
-	Token      int       `json:"token,omitempty"`
-	Logprobs   []float32 `json:"logprobs,omitempty"`
-	Done       bool      `json:"done,omitempty"`
-	DoneReason int       `json:"done_reason,omitempty"`
-
-	PromptTokens             int           `json:"prompt_eval_count,omitempty"`
-	PromptTokensDuration     time.Duration `json:"prompt_eval_duration,omitempty"`
-	CompletionTokens         int           `json:"eval_count,omitempty"`
-	CompletionTokensDuration time.Duration `json:"eval_duration,omitempty"`
-	TotalTokens              int           `json:"total_tokens,omitempty"`
-}
-
 type Runner struct {
-	Model        base.Model
-	Tokenizer    *tokenizer.Tokenizer
-	Requests     chan Request
-	CacheEntries map[int32]*CacheEntry
+	Model         base.Model
+	Tokenizer     *tokenizer.Tokenizer
+	Requests      chan Request
+	cache         kvCache
+	contextLength int
 }
 
 func (r *Runner) Load(modelName string) error {
@@ -90,6 +78,7 @@ func (r *Runner) Load(modelName string) error {
 
 	r.Model = m
 	r.Tokenizer = m.Tokenizer()
+	r.contextLength = m.MaxContextLength()
 	return nil
 }
 
@@ -157,7 +146,18 @@ func (r *Runner) Run(host, port string, mux http.Handler) error {
 				return nil
 			case request := <-r.Requests:
 				if err := request.Pipeline(request); err != nil {
-					break
+					slog.Info("Request terminated", "error", err)
+					var statusErr api.StatusError
+					if !errors.As(err, &statusErr) {
+						statusErr = api.StatusError{
+							StatusCode:   http.StatusInternalServerError,
+							ErrorMessage: err.Error(),
+						}
+					}
+					select {
+					case request.Responses <- CompletionResponse{Error: &statusErr}:
+					case <-request.Ctx.Done():
+					}
 				}
 
 				close(request.Responses)
