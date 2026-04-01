@@ -652,7 +652,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 
 	fn(api.ProgressResponse{Status: "pulling manifest"})
 
-	mf, err := pullModelManifest(ctx, n, regOpts)
+	mf, manifestData, err := pullModelManifest(ctx, n, regOpts)
 	if err != nil {
 		return fmt.Errorf("pull model manifest: %s", err)
 	}
@@ -665,7 +665,7 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 
 	// Use fast transfer for models with tensor layers (many small blobs)
 	if hasTensorLayers(layers) {
-		if err := pullWithTransfer(ctx, n, layers, mf, regOpts, fn); err != nil {
+		if err := pullWithTransfer(ctx, n, layers, manifestData, regOpts, fn); err != nil {
 			return err
 		}
 		fn(api.ProgressResponse{Status: "success"})
@@ -732,11 +732,6 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 
 	fn(api.ProgressResponse{Status: "writing manifest"})
 
-	manifestJSON, err := json.Marshal(mf)
-	if err != nil {
-		return err
-	}
-
 	fp, err := manifest.PathForName(n)
 	if err != nil {
 		return err
@@ -745,11 +740,13 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return err
 	}
 
-	err = os.WriteFile(fp, manifestJSON, 0o644)
+	err = os.WriteFile(fp, manifestData, 0o644)
 	if err != nil {
 		slog.Info(fmt.Sprintf("couldn't write to %s", fp))
 		return err
 	}
+
+	slog.Debug("manifest written", "path", fp, "sha256", fmt.Sprintf("%x", sha256.Sum256(manifestData)), "size", len(manifestData))
 
 	if !envconfig.NoPrune() && len(deleteMap) > 0 {
 		fn(api.ProgressResponse{Status: "removing unused layers"})
@@ -774,7 +771,7 @@ func hasTensorLayers(layers []manifest.Layer) bool {
 }
 
 // pullWithTransfer uses the simplified x/transfer package for downloading blobs.
-func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, mf *manifest.Manifest, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
+func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer, manifestData []byte, regOpts *registryOptions, fn func(api.ProgressResponse)) error {
 	blobs := make([]transfer.Blob, len(layers))
 	for i, layer := range layers {
 		blobs[i] = transfer.Blob{
@@ -831,10 +828,6 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 
 	// Write manifest
 	fn(api.ProgressResponse{Status: "writing manifest"})
-	manifestJSON, err := json.Marshal(mf)
-	if err != nil {
-		return err
-	}
 
 	fp, err := manifest.PathForName(n)
 	if err != nil {
@@ -844,7 +837,12 @@ func pullWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 		return err
 	}
 
-	return os.WriteFile(fp, manifestJSON, 0o644)
+	if err := os.WriteFile(fp, manifestData, 0o644); err != nil {
+		return err
+	}
+
+	slog.Debug("manifest written", "path", fp, "sha256", fmt.Sprintf("%x", sha256.Sum256(manifestData)), "size", len(manifestData))
+	return nil
 }
 
 // pushWithTransfer uses the simplified x/transfer package for uploading blobs and manifest.
@@ -905,28 +903,32 @@ func pushWithTransfer(ctx context.Context, n model.Name, layers []manifest.Layer
 	})
 }
 
-func pullModelManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, error) {
+func pullModelManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, []byte, error) {
 	// Check if this is a HuggingFace registry
 	if isHuggingFaceRegistry(n.Host) {
 		return pullHuggingFaceManifest(ctx, n, regOpts)
 	}
-
 	requestURL := n.BaseURL().JoinPath("v2", n.DisplayNamespaceModel(), "manifests", n.Tag)
 
 	headers := make(http.Header)
 	headers.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
 	resp, err := makeRequestWithRetry(ctx, http.MethodGet, requestURL, headers, nil, regOpts)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
-	var m manifest.Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, err
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
 	}
 
-	return &m, err
+	var m manifest.Manifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		return nil, nil, err
+	}
+
+	return &m, data, err
 }
 
 // isHuggingFaceRegistry checks if the registry is HuggingFace
