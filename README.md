@@ -7,6 +7,18 @@ We sometimes will also add different features that we like. If you have any ques
 Here is the docker image:
 https://hub.docker.com/r/julianvanderhorst/ollama-framework-desktop
 
+You can also build it yourself with the following command:
+
+```bash
+ docker build \
+    --build-arg FLAVOR=rocm7-final \
+    --build-arg ROCM7VERSION=7.2 \
+    --build-arg AMDGPU_TARGETS="gfx1151" \
+    --build-arg PARALLEL=$(nproc) \
+    -t ollama:rocm7-gfx1151 \
+    -f Dockerfile \
+    .
+```
 ## Setup your frameworks
 
 You need to have the correct ROCM install on your framework. Make sure to follow these two guides:

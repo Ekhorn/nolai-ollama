@@ -949,7 +949,7 @@ type HFFileInfo struct {
 }
 
 // pullHuggingFaceManifest pulls a model manifest from HuggingFace
-func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, error) {
+func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registryOptions) (*manifest.Manifest, []byte, error) {
 	// For HuggingFace, the tag might be "main" or could include a subdirectory like "BF16"
 	// We'll use "main" as the revision and the tag as the subdirectory filter
 	revision := "main"
@@ -960,7 +960,7 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 
 	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating HuggingFace API request: %w", err)
+		return nil, nil, fmt.Errorf("creating HuggingFace API request: %w", err)
 	}
 
 	if regOpts != nil && regOpts.Token != "" {
@@ -970,22 +970,22 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("querying HuggingFace API: %w", err)
+		return nil, nil, fmt.Errorf("querying HuggingFace API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return nil, fmt.Errorf("model not found on HuggingFace")
+		return nil, nil, fmt.Errorf("model not found on HuggingFace")
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HuggingFace API error (%d): %s", resp.StatusCode, string(body))
+		return nil, nil, fmt.Errorf("HuggingFace API error (%d): %s", resp.StatusCode, string(body))
 	}
 
 	var files []HFFileInfo
 	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, fmt.Errorf("decoding HuggingFace API response: %w", err)
+		return nil, nil, fmt.Errorf("decoding HuggingFace API response: %w", err)
 	}
 
 	// Find GGUF files matching the tag/subdirectory
@@ -1008,7 +1008,7 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 	}
 
 	if len(ggufFiles) == 0 {
-		return nil, fmt.Errorf("no GGUF files found for tag %s", subdirFilter)
+		return nil, nil, fmt.Errorf("no GGUF files found for tag %s", subdirFilter)
 	}
 
 	// Check if these are split GGUF files
@@ -1034,7 +1034,7 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 			}
 
 			if fileInfo == nil {
-				return nil, fmt.Errorf("shard file info not found: %s", shardPath)
+				return nil, nil, fmt.Errorf("shard file info not found: %s", shardPath)
 			}
 
 			// Create a layer for this shard
@@ -1063,7 +1063,7 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 		}
 
 		if fileInfo == nil {
-			return nil, fmt.Errorf("GGUF file info not found")
+			return nil, nil, fmt.Errorf("GGUF file info not found")
 		}
 
 		layer := manifest.Layer{
@@ -1075,7 +1075,12 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 		mf.Layers = append(mf.Layers, layer)
 	}
 
-	return &mf, nil
+	mfJSON, err := json.Marshal(mf)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshaling HuggingFace manifest: %w", err)
+	}
+
+	return &mf, mfJSON, nil
 }
 
 // extractPaths extracts file paths from HFFileInfo slice
