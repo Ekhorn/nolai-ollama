@@ -740,6 +740,13 @@ func PullModel(ctx context.Context, name string, regOpts *registryOptions, fn fu
 		return err
 	}
 
+	if isHF {
+		manifestData, err = json.Marshal(mf)
+		if err != nil {
+			return fmt.Errorf("failed to marshal updated manifest: %w", err)
+		}
+	}
+
 	err = os.WriteFile(fp, manifestData, 0o644)
 	if err != nil {
 		slog.Info(fmt.Sprintf("couldn't write to %s", fp))

@@ -910,6 +910,7 @@ func (s *Server) load(w http.ResponseWriter, r *http.Request) {
 		var tensorSplit []float32
 		var llamaIDs []uint64
 
+		llama.RegisterRPCDevices(req.RpcServers)
 		gpuIDs := llama.EnumerateGPUs()
 		sort.Sort(req.GPULayers)
 		for _, layers := range req.GPULayers {

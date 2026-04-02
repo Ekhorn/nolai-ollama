@@ -73,8 +73,8 @@ struct rpc_tensor {
     uint64_t id;
     uint32_t type;
     uint64_t buffer;
-    uint32_t ne[GGML_MAX_DIMS];
-    uint32_t nb[GGML_MAX_DIMS];
+    uint64_t ne[GGML_MAX_DIMS];
+    uint64_t nb[GGML_MAX_DIMS];
     uint32_t op;
     int32_t  op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
     int32_t  flags;
@@ -570,8 +570,8 @@ static rpc_tensor serialize_tensor(const ggml_tensor * tensor) {
         result.buffer = 0;
     }
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-        result.ne[i] = tensor->ne[i];
-        result.nb[i] = (uint32_t)tensor->nb[i];  // Cast size_t to uint32_t for RPC protocol
+        result.ne[i] = (uint64_t)tensor->ne[i];
+        result.nb[i] = (uint64_t)tensor->nb[i];
     }
     result.op = tensor->op;
     for (uint32_t i = 0; i < GGML_MAX_OP_PARAMS / sizeof(int32_t); i++) {
@@ -1112,7 +1112,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     ggml_tensor * result = ggml_new_tensor_4d(ctx, (ggml_type) tensor->type,
-        tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
+        (int64_t)tensor->ne[0], (int64_t)tensor->ne[1], (int64_t)tensor->ne[2], (int64_t)tensor->ne[3]);
 
     // ggml_new_tensor_4d might fail if dimensions are invalid, although less likely to crash than invalid type
     if (result == nullptr) {
@@ -1121,7 +1121,7 @@ ggml_tensor * rpc_server::deserialize_tensor(struct ggml_context * ctx, const rp
     }
 
     for (uint32_t i = 0; i < GGML_MAX_DIMS; i++) {
-        result->nb[i] = (size_t)tensor->nb[i];  // Convert uint32_t from RPC protocol to size_t
+        result->nb[i] = (size_t)tensor->nb[i];
     }
     result->buffer = reinterpret_cast<ggml_backend_buffer_t>(tensor->buffer);
     if (result->buffer && buffers.find(result->buffer) == buffers.end()) {

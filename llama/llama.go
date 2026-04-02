@@ -71,6 +71,17 @@ type Devices struct {
 	LlamaID uint64
 }
 
+// RegisterRPCDevices registers RPC server endpoints in the ggml backend registry.
+// Must be called before EnumerateGPUs so RPC devices appear during enumeration.
+func RegisterRPCDevices(servers string) {
+	if servers == "" {
+		return
+	}
+	cservers := C.CString(servers)
+	C.add_rpc_devices(cservers)
+	C.free(unsafe.Pointer(cservers))
+}
+
 func EnumerateGPUs() []Devices {
 	var ids []Devices
 
