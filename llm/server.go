@@ -85,13 +85,13 @@ type LlamaServer interface {
 
 // llmServer is an instance of a runner hosting a single model
 type llmServer struct {
-	port      int
-	cmd       *exec.Cmd
-	done      chan struct{} // closed when the process exits
-	doneErr   error         // valid after done is closed
-	status    *StatusWriter
-	options   api.Options
-	modelPath string
+	port            int
+	cmd             *exec.Cmd
+	done            chan struct{} // closed when the process exits
+	doneErr         error         // valid after done is closed
+	status          *StatusWriter
+	options         api.Options
+	modelPath       string
 	extraModelPaths []string
 
 	loadRequest LoadRequest       // Parameters used to initialize the runner
@@ -247,6 +247,15 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 	opts.NumBatch = min(opts.NumBatch, opts.NumCtx)
 
 	loadRequest := LoadRequest{LoraPath: adapters, KvSize: opts.NumCtx * numParallel, BatchSize: opts.NumBatch, Parallel: numParallel, MultiUserCache: envconfig.MultiUserCache(), RpcServers: rpcServers}
+
+	// Force mmap when RPC is in use — weights stream to remote GPUs and don't
+	// remain in local RAM, so the usual free-memory checks don't apply.
+	for _, g := range gpus {
+		if g.Library == "rpc" {
+			loadRequest.UseMmap = true
+			break
+		}
+	}
 
 	defaultThreads := systemInfo.ThreadCount
 	if opts.NumThread > 0 {
@@ -791,12 +800,7 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	s.loadRequest.UseMmap = true
 
 	// mmap has issues with partial offloading on metal
-	// RPC also doesn't support mmap
 	for _, g := range gpus {
-		if g.Library == "rpc" {
-			s.options.UseMMap = new(bool)
-			*s.options.UseMMap = false
-		}
 		if g.Library == "Metal" &&
 			uint64(s.options.NumGPU) > 0 &&
 			uint64(s.options.NumGPU) < s.totalLayers {
@@ -808,6 +812,8 @@ func (s *llamaServer) Load(ctx context.Context, systemInfo ml.SystemInfo, system
 	// Windows CUDA should not use mmap for best performance
 	// Linux  with a model larger than free space, mmap leads to thrashing
 	// For CPU loads we want the memory to be allocated, not FS cache
+	// RPC: weights are streamed to remote GPUs and don't remain in local RAM,
+	// so the free-memory check doesn't apply — mmap is safe regardless of local free memory.
 	totalSize, _ := s.MemorySize()
 	if (runtime.GOOS == "windows" && len(gpus) > 0 && gpus[0].Library == "CUDA" && s.options.UseMMap == nil) ||
 		(runtime.GOOS == "linux" && systemInfo.FreeMemory < totalSize && s.options.UseMMap == nil) ||

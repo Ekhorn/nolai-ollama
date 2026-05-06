@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cmath>
 #include <functional>
+#include <future>
 #include <map>
 #include <regex>
 #include <sstream>
@@ -6767,8 +6768,29 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // load tensor data
+    // RPC contexts are uploaded in parallel (mmap is thread-safe; file I/O is not).
+    // CPU/GPU contexts run sequentially on the main thread with progress reporting.
+    std::vector<std::future<bool>> rpc_futures;
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        bool is_rpc = false;
+        if (!buf_map.empty()) {
+            auto * buft = ggml_backend_buffer_get_type(buf_map.begin()->second);
+            const char * buft_name = buft ? ggml_backend_buft_name(buft) : "";
+            is_rpc = strncmp(buft_name, "RPC", 3) == 0;
+        }
+
+        if (is_rpc && ml.use_mmap) {
+            rpc_futures.push_back(std::async(std::launch::async, [&ml, ctx, &buf_map]() {
+                return ml.load_all_data(ctx, buf_map, nullptr, nullptr, nullptr);
+            }));
+        } else {
+            if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+                return false;
+            }
+        }
+    }
+    for (auto & fut : rpc_futures) {
+        if (!fut.get()) {
             return false;
         }
     }

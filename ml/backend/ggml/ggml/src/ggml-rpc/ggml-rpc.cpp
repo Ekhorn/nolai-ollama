@@ -349,15 +349,19 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
 
 static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
 
-    auto it = sockets.find(endpoint);
-    if (it != sockets.end()) {
-        if (auto sock = it->second.lock()) {
-            return sock;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto sock = it->second.lock()) {
+                return sock;
+            }
         }
     }
+
+    // Connect and negotiate outside the lock so multiple endpoints connect in parallel
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
@@ -376,7 +380,18 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
         return nullptr;
     }
     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-    sockets[endpoint] = sock;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        // Check again in case another thread connected to the same endpoint concurrently
+        auto it = sockets.find(endpoint);
+        if (it != sockets.end()) {
+            if (auto existing = it->second.lock()) {
+                return existing;
+            }
+        }
+        sockets[endpoint] = sock;
+    }
     return sock;
 }
 
