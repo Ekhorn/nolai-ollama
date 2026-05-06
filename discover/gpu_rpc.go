@@ -11,6 +11,54 @@ import (
 	"github.com/ollama/ollama/ml"
 )
 
+// rpcConnCapsSize matches RPC_CONN_CAPS_SIZE in transport.h (protocol v4+)
+const rpcConnCapsSize = 24
+
+// sendHello performs the RPC_CMD_HELLO handshake (protocol v4).
+// Returns the server version bytes [major, minor, patch] on success, nil on failure.
+func sendHello(client net.Conn, timeout time.Duration) []byte {
+	// Send RPC_CMD_HELLO command byte (14)
+	client.SetDeadline(time.Now().Add(timeout))
+	if _, err := client.Write([]byte{14}); err != nil {
+		return nil
+	}
+
+	// Send HELLO input size (8 bytes) = rpcConnCapsSize
+	client.SetDeadline(time.Now().Add(timeout))
+	helloInputSize := [8]byte{}
+	binary.LittleEndian.PutUint64(helloInputSize[:], rpcConnCapsSize)
+	if _, err := client.Write(helloInputSize[:]); err != nil {
+		return nil
+	}
+
+	// Send conn_caps (24 bytes, all zeros = no special capabilities)
+	client.SetDeadline(time.Now().Add(timeout))
+	connCaps := [rpcConnCapsSize]byte{}
+	if _, err := client.Write(connCaps[:]); err != nil {
+		return nil
+	}
+
+	// Read HELLO reply size (8 bytes) - expect 3 + 1 padding + 24 caps = 28
+	client.SetDeadline(time.Now().Add(timeout))
+	helloReplySizeBytes := [8]byte{}
+	if _, err := client.Read(helloReplySizeBytes[:]); err != nil {
+		return nil
+	}
+	helloReplySize := binary.LittleEndian.Uint64(helloReplySizeBytes[:])
+	if helloReplySize < 3 {
+		return nil
+	}
+
+	// Read HELLO reply (helloReplySize bytes): major, minor, patch, [padding+conn_caps]
+	client.SetDeadline(time.Now().Add(timeout))
+	replyBuf := make([]byte, helloReplySize)
+	if _, err := client.Read(replyBuf); err != nil {
+		return nil
+	}
+
+	return replyBuf[:3]
+}
+
 // getRPCDeviceCount gets the number of devices available on an RPC server
 func getRPCDeviceCount(endpoint string) uint32 {
 	timeout := time.Duration(5 * 1000 * 1000 * 1000)
@@ -21,34 +69,11 @@ func getRPCDeviceCount(endpoint string) uint32 {
 	}
 	defer client.Close()
 
-	// First send RPC_CMD_HELLO (14)
-	client.SetDeadline(time.Now().Add(timeout))
-	if _, err := client.Write([]byte{14}); err != nil {
+	if sendHello(client, timeout) == nil {
 		return 0
 	}
 
-	// HELLO input size (8 bytes) - no input
-	client.SetDeadline(time.Now().Add(timeout))
-	helloSize := [8]byte{}
-	if _, err := client.Write(helloSize[:]); err != nil {
-		return 0
-	}
-
-	// Read HELLO reply size (8 bytes) - should be 3
-	client.SetDeadline(time.Now().Add(timeout))
-	helloReplySize := [8]byte{}
-	if _, err := client.Read(helloReplySize[:]); err != nil {
-		return 0
-	}
-
-	// Read HELLO reply (3 bytes - version)
-	client.SetDeadline(time.Now().Add(timeout))
-	serverVersion := [3]byte{}
-	if _, err := client.Read(serverVersion[:]); err != nil {
-		return 0
-	}
-
-	// Now send RPC_CMD_DEVICE_COUNT command (15)
+	// Send RPC_CMD_DEVICE_COUNT command (15)
 	client.SetDeadline(time.Now().Add(timeout))
 	if _, err := client.Write([]byte{15}); err != nil {
 		return 0
@@ -97,52 +122,10 @@ func getRPCDeviceMemory(endpoint string, deviceIndex uint32) RPCServerMemoryResu
 	defer client.Close()
 	slog.Debug("connection established with server", "endpoint", endpoint)
 
-	// Sending RPC_CMD_HELLO command
-	// RPC Command (1 byte)
-	deadLine = time.Now().Add(timeout)
-	client.SetDeadline(deadLine)
-	_, err = client.Write([]byte{14})
-	if err != nil {
-		slog.Error("failed to send RPC_CMD_HELLO command to RPC server", "err", err)
-		return RPCServerMemoryResult{}
-	}
-	slog.Debug("successfully sent RPC_CMD_HELLO command")
-	// Input Size (8 bytes)
-	deadLine = time.Now().Add(timeout)
-	client.SetDeadline(deadLine)
-	helloSize := [8]byte{}
-	_, err = client.Write(helloSize[:])
-	if err != nil {
-		slog.Error("failed to send input size of RPC_CMD_HELLO command to RPC server", "err", err)
-		return RPCServerMemoryResult{}
-	}
-	slog.Debug("successfully sent input size of RPC_CMD_HELLO command")
-
-	// Retrieving results for RPC_CMD_HELLO command
-	// Getting reply size (8 bytes)
-	deadLine = time.Now().Add(timeout)
-	client.SetDeadline(deadLine)
-	helloReply := [8]byte{}
-	_, err = client.Read(helloReply[:])
-	if err != nil {
-		slog.Error("failed to fetch RPC server reply size of RPC_CMD_HELLO", "err", err)
-		return RPCServerMemoryResult{}
-	}
-	helloReplySize := binary.LittleEndian.Uint64(helloReply[:])
-	slog.Debug("RPC_CMD_HELLO reply size", "size", helloReplySize)
-	// Reply size should be 3 according to spec
-	if helloReplySize != 3 {
-		slog.Error("invalid reply size for RPC_CMD_HELLO")
-		return RPCServerMemoryResult{}
-	}
-	// Getting main reply
-	// The version of the RPC server (3 bytes)
-	deadLine = time.Now().Add(timeout)
-	client.SetDeadline(deadLine)
-	serverVersion := [3]byte{}
-	_, err = client.Read(serverVersion[:])
-	if err != nil {
-		slog.Error("failed to fetch RPC server version from RPC_CMD_HELLO", "err", err)
+	// Sending RPC_CMD_HELLO command (protocol v4)
+	serverVersion := sendHello(client, timeout)
+	if serverVersion == nil {
+		slog.Error("failed to complete RPC_CMD_HELLO handshake with RPC server")
 		return RPCServerMemoryResult{}
 	}
 	slog.Debug("RPC_CMD_HELLO reply", "major", serverVersion[0], "minor", serverVersion[1], "patch", serverVersion[2])

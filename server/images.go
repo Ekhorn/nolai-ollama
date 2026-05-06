@@ -1122,12 +1122,192 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 		mf.Layers = append(mf.Layers, layer)
 	}
 
+	// Try to build a params layer from HuggingFace tokenizer/generation config
+	params := fetchHFParams(ctx, n, regOpts)
+	slog.Info("fetchHFParams result", "model", n.DisplayNamespaceModel(), "params", params)
+	if len(params) > 0 {
+		var b bytes.Buffer
+		if err := json.NewEncoder(&b).Encode(params); err != nil {
+			slog.Warn("failed to encode HuggingFace params", "err", err)
+		} else if layer, err := manifest.NewLayer(&b, "application/vnd.ollama.image.params"); err != nil {
+			slog.Warn("failed to create HuggingFace params layer", "err", err)
+		} else {
+			slog.Info("adding params layer from HuggingFace config", "params", params)
+			mf.Layers = append(mf.Layers, layer)
+		}
+	}
+
 	mfJSON, err := json.Marshal(mf)
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshaling HuggingFace manifest: %w", err)
 	}
 
 	return &mf, mfJSON, nil
+}
+
+// fetchHFParams fetches params from HuggingFace for a GGUF model.
+// It first tries an Ollama-format "params" file in the repo (many GGUF repos include one),
+// then falls back to extracting stop tokens and sampling params from generation_config.json
+// and tokenizer_config.json, trying both the GGUF repo and the base model repo.
+func fetchHFParams(ctx context.Context, n model.Name, regOpts *registryOptions) map[string]any {
+	client := &http.Client{}
+
+	get := func(u string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		if regOpts != nil && regOpts.Token != "" {
+			req.Header.Set("Authorization", "Bearer "+regOpts.Token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, nil
+		}
+		return resp, nil
+	}
+
+	repo := n.DisplayNamespaceModel()
+
+	// 1. Try Ollama-format "params" file — many GGUF repos ship this directly
+	if resp, err := get(fmt.Sprintf("https://huggingface.co/%s/resolve/main/params", repo)); err == nil && resp != nil {
+		defer resp.Body.Close()
+		var p map[string]any
+		if json.NewDecoder(resp.Body).Decode(&p) == nil && len(p) > 0 {
+			slog.Debug("using HuggingFace params file", "repo", repo)
+			return p
+		}
+	}
+
+	// 2. Fall back: try generation_config.json and tokenizer_config.json
+	// These live in the base model repo, not the GGUF repo — strip known suffixes
+	parts := strings.SplitN(repo, "/", 2)
+	baseRepo := repo
+	if len(parts) == 2 {
+		for _, suffix := range []string{"-GGUF", "-gguf"} {
+			if trimmed := strings.TrimSuffix(parts[1], suffix); trimmed != parts[1] {
+				baseRepo = parts[0] + "/" + trimmed
+				break
+			}
+		}
+	}
+
+	fetchJSON := func(r, filename string) map[string]json.RawMessage {
+		resp, err := get(fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s", r, filename))
+		if err != nil || resp == nil {
+			return nil
+		}
+		defer resp.Body.Close()
+		var m map[string]json.RawMessage
+		if json.NewDecoder(resp.Body).Decode(&m) != nil {
+			return nil
+		}
+		return m
+	}
+
+	params := make(map[string]any)
+
+	// generation_config.json: sampling params + EOS token IDs
+	var eosIDs []int
+	if cfg := fetchJSON(baseRepo, "generation_config.json"); cfg != nil {
+		if raw, ok := cfg["eos_token_id"]; ok {
+			var single int
+			var multi []int
+			if json.Unmarshal(raw, &multi) == nil {
+				eosIDs = multi
+			} else if json.Unmarshal(raw, &single) == nil {
+				eosIDs = []int{single}
+			}
+		}
+		floatParam := func(key, ollamaKey string) {
+			if raw, ok := cfg[key]; ok {
+				var v float32
+				if json.Unmarshal(raw, &v) == nil {
+					params[ollamaKey] = v
+				}
+			}
+		}
+		intParam := func(key, ollamaKey string) {
+			if raw, ok := cfg[key]; ok {
+				var v int
+				if json.Unmarshal(raw, &v) == nil {
+					params[ollamaKey] = v
+				}
+			}
+		}
+		floatParam("temperature", "temperature")
+		floatParam("top_p", "top_p")
+		floatParam("repetition_penalty", "repeat_penalty")
+		intParam("top_k", "top_k")
+		intParam("max_new_tokens", "num_predict")
+	}
+
+	// tokenizer_config.json: stop token strings
+	seen := make(map[string]bool)
+	var stopTokens []string
+	addStop := func(s string) {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			stopTokens = append(stopTokens, s)
+		}
+	}
+
+	if cfg := fetchJSON(baseRepo, "tokenizer_config.json"); cfg != nil {
+		if raw, ok := cfg["eos_token"]; ok {
+			var s string
+			var mm map[string]any
+			if json.Unmarshal(raw, &s) == nil {
+				addStop(s)
+			} else if json.Unmarshal(raw, &mm) == nil {
+				if content, ok := mm["content"].(string); ok {
+					addStop(content)
+				}
+			}
+		}
+		if raw, ok := cfg["additional_special_tokens"]; ok {
+			var tokens []string
+			if json.Unmarshal(raw, &tokens) == nil {
+				for _, t := range tokens {
+					tl := strings.ToLower(t)
+					if strings.Contains(tl, "end") || strings.Contains(tl, "eot") || strings.Contains(tl, "im_end") {
+						addStop(t)
+					}
+				}
+			}
+		}
+	}
+
+	// If EOS IDs found but no string token yet, resolve via tokenizer.json
+	if len(eosIDs) > 0 && len(stopTokens) == 0 {
+		if tj := fetchJSON(baseRepo, "tokenizer.json"); tj != nil {
+			type addedToken struct {
+				ID      int    `json:"id"`
+				Content string `json:"content"`
+			}
+			if raw, ok := tj["added_tokens"]; ok {
+				var added []addedToken
+				if json.Unmarshal(raw, &added) == nil {
+					idToContent := make(map[int]string, len(added))
+					for _, at := range added {
+						idToContent[at.ID] = at.Content
+					}
+					for _, id := range eosIDs {
+						addStop(idToContent[id])
+					}
+				}
+			}
+		}
+	}
+
+	if len(stopTokens) > 0 {
+		params["stop"] = stopTokens
+	}
+
+	return params
 }
 
 // extractPaths extracts file paths from HFFileInfo slice
