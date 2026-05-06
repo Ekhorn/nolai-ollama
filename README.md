@@ -62,7 +62,7 @@ services:
       - AMD_VISIBLE_DEVICES=all
       - OLLAMA_LIBRARY_PATH=/usr/lib/ollama:/usr/lib/ollama/rocm_v7
       - LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama:/usr/lib/ollama/rocm_v7
-    command: rpc --host 0.0.0.0 --port 50053 --device ROCm0 --cache-dir /root/.ollama/rpc-cache
+    command: rpc --host 0.0.0.0 --port 50053 --device ROCm0
 volumes:
   ollama: {}
 ```

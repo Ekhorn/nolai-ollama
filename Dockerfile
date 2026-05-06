@@ -252,7 +252,7 @@ COPY --from=rocm-7 dist/lib/ollama /usr/lib/ollama
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama
 ENV OLLAMA_HOST=0.0.0.0:11434
 RUN dnf clean all && \
-    rm -rf /var/cache/dnf/* /var/lib/dnf/*.sqlite* /var/lib/dnf/history.* /tmp/*
+    rm -rf /var/cache/dnf/* /var/lib/dnf/*.sqlite* /var/lib/dnf/history.* /tmp/* /var/lib/rpm/__db.*
 EXPOSE 11434
 ENTRYPOINT ["/usr/bin/ollama"]
 CMD ["serve"]
