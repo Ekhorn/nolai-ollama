@@ -1,0 +1,52 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp	2026-06-09 15:37:34.021607704 +0200
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp	2026-06-09 15:45:06.980286375 +0200
+@@ -348,15 +348,22 @@
+ 
+ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+     static std::mutex mutex;
+-    std::lock_guard<std::mutex> lock(mutex);
+     static std::unordered_map<std::string, std::weak_ptr<socket_t>> sockets;
+ 
+-    auto it = sockets.find(endpoint);
+-    if (it != sockets.end()) {
+-        if (auto sock = it->second.lock()) {
+-            return sock;
++    // Fast path: check cache under lock before doing any I/O.
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        auto it = sockets.find(endpoint);
++        if (it != sockets.end()) {
++            if (auto sock = it->second.lock()) {
++                return sock;
++            }
+         }
+     }
++
++    // Slow path: connect without holding the lock so multiple endpoints
++    // can connect in parallel (e.g. during initial model load with many
++    // RPC workers).
+     std::string host;
+     int port;
+     if (!parse_endpoint(endpoint, host, port)) {
+@@ -375,7 +382,19 @@
+         return nullptr;
+     }
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+-    sockets[endpoint] = sock;
++
++    // Re-acquire lock to store the new socket, checking for a race where
++    // another thread connected to the same endpoint while we were connecting.
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        auto it = sockets.find(endpoint);
++        if (it != sockets.end()) {
++            if (auto existing = it->second.lock()) {
++                return existing;
++            }
++        }
++        sockets[endpoint] = sock;
++    }
+     return sock;
+ }
+ 

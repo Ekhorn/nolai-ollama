@@ -1,0 +1,199 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index d380577..7dd0ef2 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -11,6 +11,7 @@
+ #include <vector>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <cstring>
+@@ -83,11 +84,13 @@ struct rpc_msg_hello_req {
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
++static constexpr uint8_t RPC_HELLO_FLAG_HAS_CACHE = 0x01;
++
+ struct rpc_msg_hello_rsp {
+     uint8_t major;
+     uint8_t minor;
+     uint8_t patch;
+-    uint8_t padding;
++    uint8_t flags;
+     uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
+ };
+ 
+@@ -324,10 +327,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+ 
+ // RPC client-side implementation
+ 
++// Per-endpoint cache capability flag, set during negotiate_hello.
++static std::unordered_map<std::string, bool> endpoint_has_cache;
++static std::mutex endpoint_has_cache_mutex;
++
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+-static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
++static bool negotiate_hello(const std::shared_ptr<socket_t> & sock, const std::string & endpoint) {
+     rpc_msg_hello_req request = {};
+     rpc_msg_hello_rsp response = {};
+ 
+@@ -343,6 +350,11 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+     }
+ 
+     sock->update_caps(response.conn_caps);
++
++    {
++        std::lock_guard<std::mutex> lock(endpoint_has_cache_mutex);
++        endpoint_has_cache[endpoint] = (response.flags & RPC_HELLO_FLAG_HAS_CACHE) != 0;
++    }
+     return true;
+ }
+ 
+@@ -371,7 +383,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+     if (sock == nullptr) {
+         return nullptr;
+     }
+-    if (!negotiate_hello(sock)) {
++    if (!negotiate_hello(sock, endpoint)) {
+         return nullptr;
+     }
+     LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
+@@ -465,7 +477,15 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+-    if (size > HASH_THRESHOLD) {
++    bool has_cache = false;
++    {
++        std::lock_guard<std::mutex> lock(endpoint_has_cache_mutex);
++        auto it = endpoint_has_cache.find(buffer->buft->context ? ((ggml_backend_rpc_buffer_type_context *)buffer->buft->context)->endpoint : "");
++        if (it != endpoint_has_cache.end()) {
++            has_cache = it->second;
++        }
++    }
++    if (has_cache && size > HASH_THRESHOLD) {
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+         request.offset = offset;
+@@ -478,13 +498,17 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+             return;
+         }
+     }
+-    // input serialization format: | rpc_tensor | offset (8 bytes) | data (size bytes)
+-    size_t input_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
+-    std::vector<uint8_t> input(input_size, 0);
+-    memcpy(input.data(), &rpc_tensor, sizeof(rpc_tensor));
+-    memcpy(input.data() + sizeof(rpc_tensor), &offset, sizeof(offset));
+-    memcpy(input.data() + sizeof(rpc_tensor) + sizeof(offset), data, size);
+-    bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR, input.data(), input.size());
++    // Zero-copy path: send | cmd (1) | total_size (8) | rpc_tensor | offset (8) | with MSG_MORE,
++    // then send tensor data directly — kernel coalesces into one write, no intermediate heap copy.
++    uint8_t cmd_byte = RPC_CMD_SET_TENSOR;
++    uint64_t total_size = sizeof(rpc_tensor) + sizeof(uint64_t) + size;
++    uint64_t offset64 = offset;
++    bool status =
++        ctx->sock->send_data_more(&cmd_byte,   sizeof(cmd_byte))   &&
++        ctx->sock->send_data_more(&total_size,  sizeof(total_size)) &&
++        ctx->sock->send_data_more(&rpc_tensor,  sizeof(rpc_tensor)) &&
++        ctx->sock->send_data_more(&offset64,    sizeof(offset64))   &&
++        ctx->sock->send_data(data, size);
+     RPC_STATUS_ASSERT(status);
+ }
+ 
+@@ -866,6 +890,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
++    response.flags = cache_dir ? RPC_HELLO_FLAG_HAS_CACHE : 0;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -1755,9 +1780,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         }
+         printf("Accepted client connection\n");
+         fflush(stdout);
+-        rpc_serve_client(backends, cache_dir, client_socket);
+-        printf("Client connection closed\n");
+-        fflush(stdout);
++        std::thread([backends, cache_dir, client_socket]() mutable {
++            rpc_serve_client(backends, cache_dir, client_socket);
++            printf("Client connection closed\n");
++            fflush(stdout);
++        }).detach();
+     }
+     rpc_transport_shutdown();
+     for (auto backend : backends) {
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index a728152..10ff16c 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -117,6 +117,7 @@ struct socket_t::impl {
+     impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
+     ~impl();
+     bool send_data(const void * data, size_t size);
++    bool send_data_more(const void * data, size_t size);
+     bool recv_data(void * data, size_t size);
+     void get_caps(uint8_t * local_caps);
+     void update_caps(const uint8_t * remote_caps);
+@@ -479,6 +480,25 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+     return true;
+ }
+ 
++bool socket_t::impl::send_data_more(const void * data, size_t size) {
++#if defined(MSG_MORE)
++    size_t bytes_sent = 0;
++    while (bytes_sent < size) {
++        size_t size_to_send = std::min(size - bytes_sent, MAX_CHUNK_SIZE);
++        ssize_t n = send(fd, (const char *)data + bytes_sent, size_to_send, MSG_MORE);
++        if (n < 0) {
++            GGML_LOG_ERROR("send (MSG_MORE) failed (bytes_sent=%zu, size_to_send=%zu)\n",
++                           bytes_sent, size_to_send);
++            return false;
++        }
++        bytes_sent += (size_t)n;
++    }
++    return true;
++#else
++    return send_data(data, size);
++#endif
++}
++
+ bool socket_t::impl::recv_data(void * data, size_t size) {
+ #ifdef GGML_RPC_RDMA
+     if (use_rdma) {
+@@ -552,6 +572,10 @@ bool socket_t::send_data(const void * data, size_t size) {
+     return pimpl->send_data(data, size);
+ }
+ 
++bool socket_t::send_data_more(const void * data, size_t size) {
++    return pimpl->send_data_more(data, size);
++}
++
+ bool socket_t::recv_data(void * data, size_t size) {
+     return pimpl->recv_data(data, size);
+ }
+@@ -618,7 +642,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
+     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
+         return nullptr;
+     }
+-    if (listen(sockfd, 1) < 0) {
++    if (listen(sockfd, 128) < 0) {
+         return nullptr;
+     }
+     return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 73b85cc..edb8702 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -14,6 +14,7 @@ struct socket_t {
+     ~socket_t();
+ 
+     bool send_data(const void * data, size_t size);
++    bool send_data_more(const void * data, size_t size);
+     bool recv_data(void * data, size_t size);
+ 
+     socket_ptr accept();
