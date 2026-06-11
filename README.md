@@ -28,6 +28,10 @@ https://instinct.docs.amd.com/projects/container-toolkit/en/latest/container-run
 
 Make sure your frameworks have a good and fast connection between them. You can use a good usb4 cable or network them together with a switch
 
+## Breaking change
+
+The RPC worker is now `llama-rpc-server` (from upstream llama.cpp) instead of the previous `ollama rpc` subcommand. Update your worker `docker-compose.yml` to set `entrypoint: ["/usr/lib/ollama/rocm_v7_2/llama-rpc-server"]` and replace the old `command: rpc --host ... --device ROCm0` with `command: ["--host", "0.0.0.0", "--port", "50053", "--cache"]`. See the example below.
+
 ## RPC docker compose
 ```
 services:
@@ -42,8 +46,7 @@ services:
     environment:
       - export OLLAMA_LOAD_TIMEOUT=10m
       - OLLAMA_RPC_SERVERS=127.0.0.1:50053
-      - OLLAMA_LIBRARY_PATH=/usr/lib/ollama:/usr/lib/ollama/rocm_v7
-      - LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama:/usr/lib/ollama/rocm_v7
+      - LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama:/usr/lib/ollama/rocm_v7_2
     depends_on:
       - ollama_rpc_worker
 
@@ -51,20 +54,25 @@ services:
     container_name: ollama_rpc_worker_sam
     volumes:
       - ollama:/root/.ollama
+      - rpc_cache:/rpc_cache
     image: julianvanderhorst/ollama-framework-desktop:latest
     runtime: amd
     restart: unless-stopped
     network_mode: "host"
     environment:
       - AMD_VISIBLE_DEVICES=all
-      - OLLAMA_LIBRARY_PATH=/usr/lib/ollama:/usr/lib/ollama/rocm_v7
-      - LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama:/usr/lib/ollama/rocm_v7
-    command: rpc --host 0.0.0.0 --port 50053 --device ROCm0
+      - LD_LIBRARY_PATH=/opt/rocm/lib:/usr/lib/ollama:/usr/lib/ollama/rocm_v7_2
+      - LLAMA_CACHE=/rpc_cache
+    entrypoint: ["/usr/lib/ollama/rocm_v7_2/llama-rpc-server"]
+    command: ["--host", "0.0.0.0", "--port", "50053", "--cache"]
 volumes:
   ollama: {}
+  rpc_cache: {}
 ```
 
 You can just add RPC clients to OLLAMA_RPC_SERVERS by appending them with a comma. `127.0.0.1:50053,192.168.1.1:50053,192.168.1.12:50053 etc.`
+
+The `--cache` flag enables a persistent on-disk tensor cache on the worker. The `rpc_cache` volume keeps it across restarts so warm model reloads skip the network transfer.
   
 <p align="center">
   <a href="https://ollama.com">
