@@ -44,8 +44,6 @@ import (
 	"github.com/ollama/ollama/middleware"
 	"github.com/ollama/ollama/model/parsers"
 	"github.com/ollama/ollama/model/renderers"
-	"github.com/ollama/ollama/server/internal/client/ollama"
-	"github.com/ollama/ollama/server/internal/registry"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/thinking"
 	"github.com/ollama/ollama/tools"
@@ -1833,7 +1831,7 @@ func allowedHostsMiddleware(addr net.Addr) gin.HandlerFunc {
 	}
 }
 
-func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
+func (s *Server) GenerateRoutes() (http.Handler, error) {
 	corsConfig := cors.DefaultConfig()
 	corsConfig.AllowWildcard = true
 	corsConfig.AllowBrowserExtensions = true
@@ -1923,18 +1921,6 @@ func (s *Server) GenerateRoutes(rc *ollama.Registry) (http.Handler, error) {
 	// Inference (Anthropic compatibility)
 	r.POST("/v1/messages", s.withInferenceRequestLogging("/v1/messages", cloudPassthroughMiddleware(cloudErrRemoteInferenceUnavailable), middleware.AnthropicMessagesMiddleware(), s.ChatHandler)...)
 
-	if rc != nil {
-		// wrap old with new
-		rs := &registry.Local{
-			Client:   rc,
-			Logger:   slog.Default(), // TODO(bmizerany): Take a logger, do not use slog.Default()
-			Fallback: r,
-
-			Prune: PruneLayers,
-		}
-		return rs, nil
-	}
-
 	return r, nil
 }
 
@@ -1998,16 +1984,11 @@ func Serve(ln net.Listener) error {
 		return err
 	}
 
-	var rc *ollama.Registry
 	if useClient2 {
-		var err error
-		rc, err = ollama.DefaultRegistry()
-		if err != nil {
-			return err
-		}
+		slog.Warn("OLLAMA_EXPERIMENT=client2 is no longer available. Please remove this environment.")
 	}
 
-	h, err := s.GenerateRoutes(rc)
+	h, err := s.GenerateRoutes()
 	if err != nil {
 		return err
 	}
@@ -2286,7 +2267,7 @@ func (s *Server) SignoutHandler(c *gin.Context) {
 func (s *Server) PsHandler(c *gin.Context) {
 	models := []api.ProcessModelResponse{}
 
-	for _, v := range s.sched.loaded {
+	for _, v := range s.sched.loadedModels() {
 		m := v.model
 		displayName := model.ParseName(m.ShortName).DisplayShortest()
 		modelDetails := api.ModelDetails{
@@ -2297,30 +2278,16 @@ func (s *Server) PsHandler(c *gin.Context) {
 			QuantizationLevel: m.Config.FileType,
 		}
 
-		mr := api.ProcessModelResponse{
-			Model:     displayName,
-			Name:      displayName,
-			Size:      int64(v.totalSize),
-			SizeVRAM:  int64(v.vramSize),
-			Digest:    m.Digest,
-			Details:   modelDetails,
-			ExpiresAt: v.expiresAt,
-		}
-		if v.llama != nil {
-			mr.ContextLength = v.llama.ContextLength()
-			total, vram := v.llama.MemorySize()
-			mr.Size = int64(total)
-			mr.SizeVRAM = int64(vram)
-		}
-		// The scheduler waits to set expiresAt, so if a model is loading it's
-		// possible that it will be set to the unix epoch. For those cases, just
-		// calculate the time w/ the sessionDuration instead.
-		var epoch time.Time
-		if v.expiresAt == epoch {
-			mr.ExpiresAt = time.Now().Add(v.sessionDuration)
-		}
-
-		models = append(models, mr)
+		models = append(models, api.ProcessModelResponse{
+			Model:         displayName,
+			Name:          displayName,
+			Size:          v.size,
+			SizeVRAM:      v.sizeVRAM,
+			Digest:        m.Digest,
+			Details:       modelDetails,
+			ExpiresAt:     v.expiresAt,
+			ContextLength: v.contextLength,
+		})
 	}
 
 	slices.SortStableFunc(models, func(i, j api.ProcessModelResponse) int {
@@ -2790,9 +2757,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			// current approach uses the transition from parsed thinking content to
 			// parsed non-thinking content as the signal to turn constraining on
 
-			// TODO(parthsareen): temporary fix for https://github.com/ollama/ollama/issues/15260.
-			// To revisit for other models and have a consistent pattern across models through parsers.
-			forceImmediate := m.Config.Parser == "gemma4" && req.Think != nil && !req.Think.Bool()
+			forceImmediate := builtinParser != nil && builtinParser.HasThinkingSupport() && req.Think != nil && !req.Think.Bool()
 			if req.Format != nil && structuredOutputsState == structuredOutputsState_None && !forceImmediate && ((builtinParser != nil || thinkingState != nil) && slices.Contains(m.Capabilities(), model.CapabilityThinking)) {
 				currentFormat = nil
 			}
