@@ -1879,7 +1879,7 @@ func TestShardedGGUF(t *testing.T) {
 			t.Fatalf("expected status code 200, actual %d", w.Code)
 		}
 
-		manifest, err := ParseNamedManifest(model.ParseName("test-single-full"))
+		manifest, err := manifest.ParseNamedManifest(model.ParseName("test-single-full"))
 		if err != nil {
 			t.Fatalf("parse manifest: %v", err)
 		}
@@ -1912,7 +1912,7 @@ func TestShardedGGUF(t *testing.T) {
 			splitDigest1, splitDigest2, splitDigest3,
 		}
 
-		manifest, err := ParseNamedManifest(model.ParseName("test-complete-split"))
+		manifest, err := manifest.ParseNamedManifest(model.ParseName("test-complete-split"))
 		if err != nil {
 			t.Fatalf("parse manifest: %v", err)
 		}
@@ -1945,7 +1945,7 @@ func TestShardedGGUF(t *testing.T) {
 			splitDigest1, splitDigest2, splitDigest3,
 		}
 
-		manifest, err := ParseNamedManifest(model.ParseName("test-complete-split-misorder"))
+		manifest, err := manifest.ParseNamedManifest(model.ParseName("test-complete-split-misorder"))
 		if err != nil {
 			t.Fatalf("parse manifest: %v", err)
 		}
@@ -1979,7 +1979,7 @@ func TestShardedGGUF(t *testing.T) {
 			fullDigest, splitDigest1, splitDigest2, splitDigest3,
 		}
 
-		manifest, err := ParseNamedManifest(model.ParseName("test-full-split-mixing"))
+		manifest, err := manifest.ParseNamedManifest(model.ParseName("test-full-split-mixing"))
 		if err != nil {
 			t.Fatalf("parse manifest: %v", err)
 		}

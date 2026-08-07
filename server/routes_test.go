@@ -641,6 +641,172 @@ func TestGetModelInfo_SafetensorsModelfileUsesShortName(t *testing.T) {
 	}
 }
 
+// TestGetModelSelectsFirstSplit covers manifests that carry one
+// application/vnd.ollama.image.model layer per GGUF split (as produced when
+// pulling a split model from Hugging Face). llama.cpp must be handed the first
+// split; pointing it at any other one fails with "illegal split file idx".
+func TestGetModelSelectsFirstSplit(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	const count = 3
+	digests := make([]string, count)
+	for i := range digests {
+		_, digest := createBinFile(t, ggml.KV{
+			"general.architecture": "llama",
+			"split.no":             uint16(i),
+			"split.count":          uint16(count),
+		}, nil)
+		digests[i] = digest
+	}
+
+	// Splits are laid out in natural order, so the final layer is the last
+	// split. This is the shape seen when pulling a split model from Hugging
+	// Face, and it is what made a naive "last model layer wins" scan select
+	// the wrong file.
+	layers := make([]manifest.Layer, 0, count)
+	for i := range count {
+		layer, err := manifest.NewLayerFromLayer(digests[i], "application/vnd.ollama.image.model", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		layers = append(layers, layer)
+	}
+
+	configLayer, err := createConfigLayer(layers, model.ConfigV2{
+		ModelFormat:   "gguf",
+		ModelFamily:   "llama",
+		ModelFamilies: []string{"llama"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	name := model.ParseName("split-gguf")
+	if err := manifest.WriteManifest(name, *configLayer, layers); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := GetModel(name.String())
+	if err != nil {
+		t.Fatalf("GetModel() error = %v", err)
+	}
+
+	// llama.cpp derives the remaining shards by rewriting the index in the
+	// first shard's filename, so ModelPath must point at a name matching its
+	// convention rather than at the bare content-addressed blob.
+	if got := filepath.Base(m.ModelPath); got != "model-00001-of-00003.gguf" {
+		t.Fatalf("ModelPath = %q, want a first-shard split name", m.ModelPath)
+	}
+
+	// Every shard must be present alongside it, and each link must resolve to
+	// the blob for the matching split index.
+	for i := range count {
+		linkPath := filepath.Join(filepath.Dir(m.ModelPath), fmt.Sprintf("model-%05d-of-%05d.gguf", i+1, count))
+		blobPath, err := manifest.BlobsPath(digests[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		linkInfo, err := os.Stat(linkPath)
+		if err != nil {
+			t.Fatalf("shard %d: %v", i+1, err)
+		}
+		blobInfo, err := os.Stat(blobPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !os.SameFile(linkInfo, blobInfo) {
+			t.Fatalf("shard %d links to the wrong blob", i+1)
+		}
+	}
+}
+
+// TestGetModelSplitGGUFIsStableAcrossLoads verifies that reloading a model
+// reuses the existing links rather than failing on the ones already there.
+func TestGetModelSplitGGUFIsStableAcrossLoads(t *testing.T) {
+	t.Setenv("OLLAMA_MODELS", t.TempDir())
+
+	const count = 2
+	digests := make([]string, count)
+	for i := range digests {
+		_, digest := createBinFile(t, ggml.KV{
+			"general.architecture": "llama",
+			"split.no":             uint16(i),
+			"split.count":          uint16(count),
+		}, nil)
+		digests[i] = digest
+	}
+
+	layers := make([]manifest.Layer, 0, count)
+	for i := range count {
+		layer, err := manifest.NewLayerFromLayer(digests[i], "application/vnd.ollama.image.model", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		layers = append(layers, layer)
+	}
+
+	configLayer, err := createConfigLayer(layers, model.ConfigV2{
+		ModelFormat:   "gguf",
+		ModelFamily:   "llama",
+		ModelFamilies: []string{"llama"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	name := model.ParseName("split-gguf-reload")
+	if err := manifest.WriteManifest(name, *configLayer, layers); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := GetModel(name.String())
+	if err != nil {
+		t.Fatalf("first GetModel() error = %v", err)
+	}
+	second, err := GetModel(name.String())
+	if err != nil {
+		t.Fatalf("second GetModel() error = %v", err)
+	}
+
+	if first.ModelPath != second.ModelPath {
+		t.Fatalf("ModelPath changed across loads: %q then %q", first.ModelPath, second.ModelPath)
+	}
+}
+
+// TestPruneSplitGGUFLinkDirs verifies that the hard links backing a split
+// model are removed once its blobs are gone. They hold a reference to the
+// shard data, so leaving them behind would keep the space allocated.
+func TestPruneSplitGGUFLinkDirs(t *testing.T) {
+	p := t.TempDir()
+	t.Setenv("OLLAMA_MODELS", p)
+
+	blobs, err := manifest.BlobsPath("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	live := filepath.Join(blobs, "splits", "aaaa")
+	orphan := filepath.Join(blobs, "splits", "bbbb")
+	for _, dir := range []string{live, orphan} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Only the live directory has a corresponding first-shard blob.
+	if err := os.WriteFile(filepath.Join(blobs, "sha256-aaaa"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pruneSplitGGUFLinkDirs()
+
+	if _, err := os.Stat(live); err != nil {
+		t.Fatalf("link dir with a live blob was removed: %v", err)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("orphaned link dir survived pruning (err = %v)", err)
+	}
+}
+
 func casingShuffle(s string) string {
 	rr := []rune(s)
 	for i := range rr {

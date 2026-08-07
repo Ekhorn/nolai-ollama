@@ -1558,6 +1558,57 @@ func TestSelectLlamaServerPlacement(t *testing.T) {
 			wantLibrary:      "CUDA",
 			wantSelectedGPUs: 2,
 		},
+		{
+			name:          "too large for one device uses two rather than the whole group",
+			predictedVRAM: 150 * format.GigaByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "rpc"}, FreeMemory: 117 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "rpc"}, FreeMemory: 95 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "2", Library: "rpc"}, FreeMemory: 31 * format.GigaByte},
+			},
+			opts:             api.DefaultOptions(),
+			wantLibrary:      "rpc",
+			wantSelectedGPUs: 2,
+			wantGPUID:        "0",
+		},
+		{
+			name:          "subset prefers the roomiest devices",
+			predictedVRAM: 40 * format.GigaByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "rpc"}, FreeMemory: 8 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "rpc"}, FreeMemory: 25 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "2", Library: "rpc"}, FreeMemory: 24 * format.GigaByte},
+			},
+			opts:             api.DefaultOptions(),
+			wantLibrary:      "rpc",
+			wantSelectedGPUs: 2,
+			wantGPUID:        "1",
+		},
+		{
+			name:          "needing every device falls through to the group",
+			predictedVRAM: 60 * format.GigaByte,
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "rpc"}, FreeMemory: 25 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "rpc"}, FreeMemory: 24 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "2", Library: "rpc"}, FreeMemory: 23 * format.GigaByte},
+			},
+			opts:             api.DefaultOptions(),
+			wantLibrary:      "rpc",
+			wantSelectedGPUs: 3,
+		},
+		{
+			name:          "spread disables subset selection",
+			predictedVRAM: 150 * format.GigaByte,
+			schedSpread:   "1",
+			gpus: []ml.DeviceInfo{
+				{DeviceID: ml.DeviceID{ID: "0", Library: "rpc"}, FreeMemory: 117 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "1", Library: "rpc"}, FreeMemory: 95 * format.GigaByte},
+				{DeviceID: ml.DeviceID{ID: "2", Library: "rpc"}, FreeMemory: 31 * format.GigaByte},
+			},
+			opts:             api.DefaultOptions(),
+			wantLibrary:      "rpc",
+			wantSelectedGPUs: 3,
+		},
 	}
 
 	for _, tt := range tests {

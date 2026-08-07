@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -658,6 +660,148 @@ func GetManifest(n model.Name) (*manifest.Manifest, string, error) {
 	return &manifestFile, hex.EncodeToString(sha256sum.Sum(nil)), nil
 }
 
+// ggufSplitInfo reports the zero-based index and total count of a split GGUF,
+// if the file carries split metadata. These keys are stored unprefixed by
+// llama.cpp's gguf-split, but gguf.File.KeyValue implicitly prefixes
+// non-general/tokenizer keys with the architecture, so scan the raw key
+// values instead.
+func ggufSplitInfo(f *gguf.File) (no, count uint64, ok bool) {
+	for _, kv := range f.KeyValues() {
+		switch kv.Key {
+		case "split.no":
+			no, ok = kv.Uint(), true
+		case "split.count":
+			count = kv.Uint()
+		}
+	}
+	return no, count, ok
+}
+
+// splitGGUFLinkDir materializes a directory of hard links to the shard blobs,
+// named with llama.cpp's `-00001-of-0000N.gguf` convention, and returns the
+// path of the first shard.
+//
+// llama.cpp is handed only the first shard and derives the rest by rewriting
+// the index in its filename. Ollama stores blobs content-addressed as
+// sha256-<hex>, which carries no such pattern, so the names have to be
+// recreated before the model can be loaded.
+//
+// The links are reused across loads: they are cheap (no data is copied, both
+// names refer to the same inode) and stable, so a model that is loaded,
+// evicted, and loaded again does not rebuild them.
+func splitGGUFLinkDir(shards []manifest.Layer) (string, error) {
+	if len(shards) == 0 {
+		return "", errors.New("no split GGUF shards")
+	}
+
+	blobs, err := manifest.BlobsPath("")
+	if err != nil {
+		return "", err
+	}
+
+	// Key the directory on the first shard's digest so distinct models (and
+	// distinct quantizations of the same model) never collide.
+	dir := filepath.Join(blobs, "splits", strings.TrimPrefix(shards[0].Digest, "sha256:"))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+
+	base := splitGGUFBaseName(shards[0].Name)
+	first := ""
+	for i, shard := range shards {
+		blobPath, err := manifest.BlobsPath(shard.Digest)
+		if err != nil {
+			return "", err
+		}
+
+		linkPath := filepath.Join(dir, parser.ShardName(base, i+1, len(shards)))
+		if i == 0 {
+			first = linkPath
+		}
+
+		if _, err := os.Stat(linkPath); err == nil {
+			continue
+		}
+		if err := os.Link(blobPath, linkPath); err != nil {
+			// A cross-device or filesystem-level failure is not fatal on its
+			// own, but without every shard linked llama.cpp cannot load the
+			// model, so surface it.
+			return "", fmt.Errorf("linking split GGUF shard %d: %w", i+1, err)
+		}
+	}
+
+	return first, nil
+}
+
+// splitGGUFBaseName recovers the model-name prefix from a stored shard
+// filename, falling back to a fixed name for manifests written before shard
+// names were recorded. The prefix only has to be consistent across the set.
+func splitGGUFBaseName(name string) string {
+	if base, _, _, ok := parser.ParseShardName(path.Base(name)); ok {
+		return base
+	}
+	return "model"
+}
+
+// resolveSplitGGUF inspects the model layers and, when they hold a split GGUF,
+// returns the path llama.cpp should be given: the first shard, under a name
+// from which it can derive the others. It returns "" when the layers are not
+// a split set, in which case the caller keeps the plain blob path.
+func resolveSplitGGUF(modelLayers []manifest.Layer) (string, error) {
+	if len(modelLayers) < 2 {
+		return "", nil
+	}
+
+	type shard struct {
+		layer manifest.Layer
+		no    uint64
+	}
+
+	var (
+		shards []shard
+		count  uint64
+	)
+	for _, layer := range modelLayers {
+		blobPath, err := manifest.BlobsPath(layer.Digest)
+		if err != nil {
+			return "", err
+		}
+		f, err := gguf.Open(blobPath)
+		if err != nil {
+			// Not readable as GGUF: not a split set we can reconstruct.
+			return "", nil
+		}
+		no, total, ok := ggufSplitInfo(f)
+		f.Close()
+		if !ok {
+			return "", nil
+		}
+		if count == 0 {
+			count = total
+		} else if count != total {
+			return "", fmt.Errorf("inconsistent split GGUF counts: %d and %d", count, total)
+		}
+		shards = append(shards, shard{layer: layer, no: no})
+	}
+
+	if int(count) != len(shards) {
+		return "", fmt.Errorf("split GGUF has %d shards, expected %d", len(shards), count)
+	}
+
+	slices.SortFunc(shards, func(a, b shard) int { return cmp.Compare(a.no, b.no) })
+	for i, s := range shards {
+		if s.no != uint64(i) {
+			return "", fmt.Errorf("split GGUF is missing shard %d", i)
+		}
+	}
+
+	ordered := make([]manifest.Layer, len(shards))
+	for i, s := range shards {
+		ordered[i] = s.layer
+	}
+	return splitGGUFLinkDir(ordered)
+}
+
 func GetModel(name string) (*Model, error) {
 	n := model.ParseName(name)
 	mf, err := manifest.ParseNamedManifest(n)
@@ -691,6 +835,8 @@ func GetModel(name string) (*Model, error) {
 
 	modelHasPooling := false
 	ggufChatTemplate := ""
+	modelLayerSeen := false
+	var modelLayers []manifest.Layer
 	for _, layer := range mf.Layers {
 		filename, err := manifest.BlobsPath(layer.Digest)
 		if err != nil {
@@ -699,18 +845,36 @@ func GetModel(name string) (*Model, error) {
 
 		switch layer.MediaType {
 		case "application/vnd.ollama.image.model":
-			m.ModelPath = filename
-			m.ParentModel = layer.From
+			// A model may be split across multiple GGUF layers (e.g. downloaded
+			// as model-00001-of-00005.gguf, ...). llama.cpp must be pointed at
+			// the first split (split.no == 0); it discovers and loads the rest
+			// itself. Inspect each candidate's split metadata rather than
+			// assuming manifest order, and don't let a later split overwrite
+			// the first one we already selected.
+			modelLayers = append(modelLayers, layer)
+			useLayer := !modelLayerSeen
 			if m.isGGUF() {
 				f, err := gguf.Open(filename)
 				if err != nil {
 					slog.Error("couldn't open model file", "error", err)
 					break
 				}
-				ggufChatTemplate = f.KeyValue("tokenizer.chat_template").String()
-				m.HasChatTemplate = ggufChatTemplate != ""
-				modelHasPooling = f.KeyValue("pooling_type").Valid()
+				if splitNo, _, ok := ggufSplitInfo(f); ok {
+					useLayer = splitNo == 0
+				} else {
+					useLayer = true
+				}
+				if useLayer {
+					ggufChatTemplate = f.KeyValue("tokenizer.chat_template").String()
+					m.HasChatTemplate = ggufChatTemplate != ""
+					modelHasPooling = f.KeyValue("pooling_type").Valid()
+				}
 				f.Close()
+			}
+			if useLayer {
+				m.ModelPath = filename
+				m.ParentModel = layer.From
+				modelLayerSeen = true
 			}
 		case manifest.MediaTypeImageDraft:
 			m.DraftPath = filename
@@ -768,6 +932,19 @@ func GetModel(name string) (*Model, error) {
 				return nil, err
 			}
 			m.License = append(m.License, string(bts))
+		}
+	}
+
+	// A split GGUF cannot be loaded from its blob path: llama.cpp derives the
+	// remaining shards from the first shard's filename. Point ModelPath at a
+	// correctly named link instead so the whole set resolves.
+	if m.isGGUF() && len(modelLayers) > 1 {
+		splitPath, err := resolveSplitGGUF(modelLayers)
+		if err != nil {
+			return nil, err
+		}
+		if splitPath != "" {
+			m.ModelPath = splitPath
 		}
 	}
 
@@ -850,9 +1027,28 @@ func deleteUnusedLayers(deleteMap map[string]struct{}) error {
 			slog.Info(fmt.Sprintf("couldn't remove file '%s': %v", fp, err))
 			continue
 		}
+		// Split GGUF shards are also hard-linked under blobs/splits/. Removing
+		// the blob alone would leave those links holding the data, so the
+		// space would never be reclaimed.
+		removeSplitGGUFLinkDir(k)
 	}
 
 	return nil
+}
+
+// removeSplitGGUFLinkDir drops the link directory keyed on the given digest,
+// if one exists. Only the first shard's digest names a directory; calling this
+// for other digests is a no-op.
+func removeSplitGGUFLinkDir(digest string) {
+	blobs, err := manifest.BlobsPath("")
+	if err != nil {
+		return
+	}
+
+	dir := filepath.Join(blobs, "splits", strings.TrimPrefix(digest, "sha256:"))
+	if err := os.RemoveAll(dir); err != nil {
+		slog.Info(fmt.Sprintf("couldn't remove split GGUF links '%s': %v", dir, err))
+	}
 }
 
 func PruneLayers() error {
@@ -909,7 +1105,38 @@ func PruneLayers() error {
 
 	slog.Info(fmt.Sprintf("total unused blobs removed: %d", len(deleteMap)))
 
+	pruneSplitGGUFLinkDirs()
+
 	return nil
+}
+
+// pruneSplitGGUFLinkDirs removes split link directories whose first shard is
+// gone. Each directory is named for that shard's digest, so its absence means
+// the model it belonged to is no longer present.
+func pruneSplitGGUFLinkDirs() {
+	blobs, err := manifest.BlobsPath("")
+	if err != nil {
+		return
+	}
+
+	root := filepath.Join(blobs, "splits")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(blobs, "sha256-"+entry.Name())); err == nil {
+			continue
+		}
+		dir := filepath.Join(root, entry.Name())
+		if err := os.RemoveAll(dir); err != nil {
+			slog.Info(fmt.Sprintf("couldn't remove split GGUF links '%s': %v", dir, err))
+		}
+	}
 }
 
 func PruneDirectory(path string) error {
@@ -1431,11 +1658,15 @@ func pullHuggingFaceManifest(ctx context.Context, n model.Name, regOpts *registr
 				return nil, nil, fmt.Errorf("shard file info not found: %s", shardPath)
 			}
 
-			// Create a layer for this shard
+			// Create a layer for this shard. The original filename is kept so
+			// the split set can be reconstructed at load time: llama.cpp
+			// derives the remaining shards from the first shard's name, which
+			// the content-addressed blob path does not preserve.
 			layer := manifest.Layer{
 				MediaType: "application/vnd.ollama.image.model",
 				Size:      fileInfo.Size,
 				Digest:    "", // Will be computed during download
+				Name:      filepath.Base(fileInfo.Path),
 			}
 
 			// Store the HuggingFace download URL in the layer

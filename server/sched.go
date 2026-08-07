@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -1034,9 +1035,58 @@ func selectLlamaServerPlacement(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, 
 		}
 	}
 
+	if !envconfig.SchedSpread() && predictedVRAM > 0 {
+		if subset, available, ok := smallestGPUSubsetFit(systemInfo, groups, predictedVRAM); ok {
+			slog.Info("selecting GPU subset for llama-server model",
+				"gpu_count", len(subset),
+				"library", subset[0].Library,
+				"predicted", format.HumanBytes2(predictedVRAM),
+				"available", format.HumanBytes2(available))
+			logSelectedGPUGroup(gpus, subset)
+			return subset, launchOpts
+		}
+	}
+
 	selected := bestGPUGroupByAvailableMemory(systemInfo, groups)
 	logSelectedGPUGroup(gpus, selected)
 	return selected, launchOpts
+}
+
+// smallestGPUSubsetFit finds the fewest devices from a single group that hold
+// the model, preferring the roomiest ones. Splitting a model across more
+// devices than it needs costs an interconnect hop per layer boundary, which for
+// RPC devices is a network round trip.
+func smallestGPUSubsetFit(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predictedVRAM uint64) (subset []ml.DeviceInfo, available uint64, ok bool) {
+	for _, group := range groups {
+		if len(group) < 2 {
+			continue
+		}
+
+		sorted := make([]ml.DeviceInfo, len(group))
+		copy(sorted, group)
+		slices.SortStableFunc(sorted, func(a, b ml.DeviceInfo) int {
+			return cmp.Compare(availableMemoryForGPU(systemInfo, b), availableMemoryForGPU(systemInfo, a))
+		})
+
+		var total uint64
+		for i, gpu := range sorted {
+			total += availableMemoryForGPU(systemInfo, gpu)
+			if predictedVRAM > total*singleGPUFitPercent/100 {
+				continue
+			}
+
+			// The whole group is not a subset: leave that to the caller so the
+			// existing group selection and its logging still apply.
+			if n := i + 1; n < len(sorted) && (!ok || n < len(subset)) {
+				subset = sorted[:n]
+				available = total
+				ok = true
+			}
+			break
+		}
+	}
+
+	return subset, available, ok
 }
 
 func singleLlamaServerGPUPlacement(gpu ml.DeviceInfo, opts api.Options) ([]ml.DeviceInfo, api.Options) {
@@ -1066,11 +1116,17 @@ func bestExplicitMainGPU(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, mai
 	return gpu, available, ok
 }
 
+// singleGPUFitPercent is how much of a device's free memory a model may be
+// predicted to use and still be placed on the fewest devices that hold it.
+// Devices rejected here spread the model wider, which for RPC means network
+// transfer between machines for a model that fewer could have held.
+const singleGPUFitPercent = 100
+
 func bestSingleGPUFit(systemInfo ml.SystemInfo, groups [][]ml.DeviceInfo, predictedVRAM uint64) (gpu ml.DeviceInfo, available uint64, ok bool) {
 	for _, group := range groups {
 		for _, candidate := range group {
 			candidateAvailable := availableMemoryForGPU(systemInfo, candidate)
-			if predictedVRAM > candidateAvailable*80/100 {
+			if predictedVRAM > candidateAvailable*singleGPUFitPercent/100 {
 				continue
 			}
 			if !ok || betterPlacementGPU(candidate, candidateAvailable, gpu, available) {

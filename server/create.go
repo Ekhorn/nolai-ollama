@@ -18,9 +18,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -33,6 +31,7 @@ import (
 	ofs "github.com/ollama/ollama/fs"
 	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/manifest"
+	"github.com/ollama/ollama/parser"
 	"github.com/ollama/ollama/template"
 	"github.com/ollama/ollama/types/errtypes"
 	"github.com/ollama/ollama/types/model"
@@ -47,92 +46,27 @@ var (
 	errFilePath                = errors.New("file path must be relative")
 	errIncompleteShardedGGUF   = errors.New("missing some GGUF splits")
 	errExtraShardedGGUF        = errors.New("extra GGUF splits found")
+	errInvalidSplitGGUF        = errors.New("invalid GGUF split")
 	errRemoteDraftUnsupported  = errors.New("DRAFT cannot be used with remote models")
 )
 
-func broadcastKV(main *ggml.GGML, subs ...*ggml.GGML) {
-	// broadcast KV value towards other shards. Only for manifest purpose
-	ggmls := []ggml.GGML{*main}
-	for i := range subs {
-		ggmls = append(ggmls, *subs[i])
-	}
-	metaggml := ggml.MakeMetaGGML(ggmls, make([]string, len(ggmls)))
-	mainKV := main.KV()
-	mainKV["general.parameter_count"] = metaggml.KV().ParameterCount()
-	for i := range subs {
-		subKV := subs[i].KV()
-		for k, v := range metaggml.KV() {
-			subKV[k] = v
-		}
-	}
-}
-
+// baseLayerSortNCheckSan moves layers without GGML metadata (e.g. chat
+// templates, parameters) to the end and verifies the base layers start with
+// a real GGUF/safetensors layer. Split GGUF shards are merged into a single
+// layerGGML upstream by mergeSplitGGUFLayers, which already validates that
+// every shard is present, contiguous, and correctly ordered.
 func baseLayerSortNCheckSan(baseLayers *[]*layerGGML) error {
 	slices.SortStableFunc(*baseLayers, func(a, b *layerGGML) int {
-		var aScore, bScore int
-		if a.GGML == nil {
-			// chat template and parameter can be added here. use very big number to move them at last
-			aScore = 0x7fffffff
-		} else {
-			aSplit := a.GGML.KV().GGUFSplitInfo()
-			if aSplit == nil {
-				aScore = -1
-			} else {
-				aScore = int(aSplit.No)
+		toScore := func(l *layerGGML) int {
+			if l.GGML == nil {
+				return 1
 			}
+			return 0
 		}
-		if b.GGML == nil {
-			bScore = 0x7fffffff
-		} else {
-			bSplit := b.GGML.KV().GGUFSplitInfo()
-			if bSplit == nil {
-				bScore = -1
-			} else {
-				bScore = int(bSplit.No)
-			}
-		}
-		return cmp.Compare(aScore, bScore)
+		return cmp.Compare(toScore(a), toScore(b))
 	})
-	// sanity check for layers
-	{
-		ggmlPtrs := make([]*ggml.GGML, 0, len(*baseLayers))
-		firstSplitCount := -1
-		foundSplitNos := make([]uint16, 0)
-		for i, layer := range *baseLayers {
-			if i == 0 {
-				if layer.GGML == nil {
-					// First item should be GGUF after sorting
-					return errNoFilesProvided
-				}
-			}
-			if layer.GGML != nil && layer.GGML.KV().GGUFSplitInfo() != nil {
-				if firstSplitCount == -1 {
-					if layer.GGML.KV().GGUFSplitInfo().No != 0 {
-						return errIncompleteShardedGGUF
-					}
-					firstSplitCount = int(layer.GGML.KV().GGUFSplitInfo().Count)
-					foundSplitNos = append(foundSplitNos, layer.KV().GGUFSplitInfo().No)
-				} else if firstSplitCount != int(layer.KV().GGUFSplitInfo().Count) {
-					return errExtraShardedGGUF
-				} else {
-					if foundSplitNos[len(foundSplitNos)-1] == layer.KV().GGUFSplitInfo().No {
-						return errExtraShardedGGUF
-					} else if foundSplitNos[len(foundSplitNos)-1] != layer.KV().GGUFSplitInfo().No-1 {
-						return errIncompleteShardedGGUF
-					} else {
-						foundSplitNos = append(foundSplitNos, layer.KV().GGUFSplitInfo().No)
-					}
-				}
-				// only gguf splits should be included
-				ggmlPtrs = append(ggmlPtrs, layer.GGML)
-			}
-		}
-		if firstSplitCount != -1 && len(foundSplitNos) != firstSplitCount {
-			return errIncompleteShardedGGUF
-		}
-		if len(ggmlPtrs) > 1 {
-			broadcastKV(ggmlPtrs[0], ggmlPtrs[1:]...)
-		}
+	if len(*baseLayers) == 0 || (*baseLayers)[0].GGML == nil {
+		return errNoFilesProvided
 	}
 	return nil
 }
@@ -283,7 +217,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		} else if r.Files != nil {
 			baseLayers, err = convertModelFromFiles(r.Files, baseLayers, false, fn)
 			if err != nil {
-				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType} {
+				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType, errInvalidSplitGGUF, errIncompleteShardedGGUF, errExtraShardedGGUF} {
 					if errors.Is(err, badReq) {
 						ch <- gin.H{"error": err.Error(), "status": http.StatusBadRequest}
 						return
@@ -314,7 +248,7 @@ func (s *Server) CreateHandler(c *gin.Context) {
 		if !remote && r.DraftFiles != nil {
 			draftLayers, err = convertDraftModelFromFiles(r.DraftFiles, baseLayers, fn)
 			if err != nil {
-				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType, errFilePath} {
+				for _, badReq := range []error{errNoFilesProvided, errOnlyGGUFSupported, errUnknownType, errFilePath, errInvalidSplitGGUF, errIncompleteShardedGGUF, errExtraShardedGGUF} {
 					if errors.Is(err, badReq) {
 						ch <- gin.H{"error": err.Error(), "status": http.StatusBadRequest}
 						return
@@ -1206,23 +1140,16 @@ func prepareSplitGGUFInput(layer *layerGGML, dir string) (*os.File, func(), erro
 	return f, cleanup, nil
 }
 
-var splitGGUFNameRe = regexp.MustCompile(`^(.*)-(\d{5})-of-(\d{5})\.gguf$`)
-
+// splitGGUFName reports the prefix, zero-based index and total count of a shard
+// filename. Note the index is zero-based here to line up with the split.no
+// metadata, while the filenames themselves are numbered from one.
 func splitGGUFName(name string) (prefix string, index, count uint16, ok bool) {
-	matches := splitGGUFNameRe.FindStringSubmatch(path.Base(name))
-	if len(matches) != 4 {
+	base, idx, n, ok := parser.ParseShardName(path.Base(name))
+	if !ok || idx == 0 || idx > math.MaxUint16 || n > math.MaxUint16 {
 		return "", 0, 0, false
 	}
 
-	idx, err := strconv.ParseUint(matches[2], 10, 16)
-	if err != nil || idx == 0 {
-		return "", 0, 0, false
-	}
-	n, err := strconv.ParseUint(matches[3], 10, 16)
-	if err != nil || n == 0 {
-		return "", 0, 0, false
-	}
-	return matches[1], uint16(idx - 1), uint16(n), true
+	return base, uint16(idx - 1), uint16(n), true
 }
 
 func splitGGUFGroupKey(layer *layerGGML) (string, bool, error) {
@@ -1236,17 +1163,17 @@ func splitGGUFGroupKey(layer *layerGGML) (string, bool, error) {
 
 	prefix, index, nameCount, ok := splitGGUFName(layer.From)
 	if !ok {
-		return "", false, fmt.Errorf("split GGUF %q must use llama.cpp split filename pattern", layer.From)
+		return "", false, fmt.Errorf("%w: %q must use llama.cpp split filename pattern", errInvalidSplitGGUF, layer.From)
 	}
 	if nameCount != count {
-		return "", false, fmt.Errorf("split GGUF %q filename count %d does not match metadata count %d", layer.From, nameCount, count)
+		return "", false, fmt.Errorf("%w: %q filename count %d does not match metadata count %d", errInvalidSplitGGUF, layer.From, nameCount, count)
 	}
 	splitNo, ok := splitGGUFUint(layer.GGML.KV(), "split.no")
 	if !ok {
-		return "", false, fmt.Errorf("split GGUF %q is missing split.no metadata", layer.From)
+		return "", false, fmt.Errorf("%w: %q is missing split.no metadata", errInvalidSplitGGUF, layer.From)
 	}
 	if splitNo != index {
-		return "", false, fmt.Errorf("split GGUF %q filename index %d does not match metadata index %d", layer.From, index, splitNo)
+		return "", false, fmt.Errorf("%w: %q filename index %d does not match metadata index %d", errInvalidSplitGGUF, layer.From, index, splitNo)
 	}
 
 	return fmt.Sprintf("%s:%s:%d", layer.MediaType, prefix, count), true, nil
@@ -1254,44 +1181,50 @@ func splitGGUFGroupKey(layer *layerGGML) (string, bool, error) {
 
 func mergeSplitGGUFLayers(layers []*layerGGML) (*layerGGML, error) {
 	if len(layers) == 0 {
-		return nil, fmt.Errorf("empty split GGUF group")
+		return nil, fmt.Errorf("%w: empty split GGUF group", errInvalidSplitGGUF)
 	}
 
 	count, ok := splitGGUFUint(layers[0].GGML.KV(), "split.count")
 	if !ok {
-		return nil, fmt.Errorf("split GGUF %q is missing split.count metadata", layers[0].From)
+		return nil, fmt.Errorf("%w: %q is missing split.count metadata", errInvalidSplitGGUF, layers[0].From)
 	}
 	if int(count) != len(layers) {
-		return nil, fmt.Errorf("split GGUF %q has %d shards, expected %d", layers[0].From, len(layers), count)
+		return nil, fmt.Errorf("%w: %q has %d shards, expected %d", errIncompleteShardedGGUF, layers[0].From, len(layers), count)
 	}
 
 	byIndex := make([]*layerGGML, count)
 	for _, layer := range layers {
 		index, ok := splitGGUFUint(layer.GGML.KV(), "split.no")
 		if !ok {
-			return nil, fmt.Errorf("split GGUF %q is missing split.no metadata", layer.From)
+			return nil, fmt.Errorf("%w: %q is missing split.no metadata", errInvalidSplitGGUF, layer.From)
 		}
 		if index >= count {
-			return nil, fmt.Errorf("split GGUF %q has invalid shard index %d", layer.From, index)
+			return nil, fmt.Errorf("%w: %q has invalid shard index %d", errInvalidSplitGGUF, layer.From, index)
 		}
 		if byIndex[index] != nil {
-			return nil, fmt.Errorf("split GGUF has duplicate shard index %d", index)
+			return nil, fmt.Errorf("%w: duplicate shard index %d", errExtraShardedGGUF, index)
 		}
 		byIndex[index] = layer
 	}
 
 	primary := byIndex[0]
 	if primary == nil {
-		return nil, fmt.Errorf("split GGUF is missing first shard")
+		return nil, fmt.Errorf("%w: missing first shard", errIncompleteShardedGGUF)
 	}
 
 	primary.splitParts = make([]splitGGUFPart, 0, count)
+	var parameterCount uint64
 	for i, layer := range byIndex {
 		if layer == nil {
-			return nil, fmt.Errorf("split GGUF %q is missing shard %d", primary.From, i)
+			return nil, fmt.Errorf("%w: %q is missing shard %d", errIncompleteShardedGGUF, primary.From, i)
 		}
+		parameterCount += layer.GGML.KV().ParameterCount()
 		primary.splitParts = append(primary.splitParts, splitGGUFPart{Digest: layer.Digest, Name: layer.From, GGML: layer.GGML})
 	}
+
+	// Each shard only counts its own tensors, so the primary's count would
+	// otherwise describe just the first shard.
+	primary.GGML.KV()["general.parameter_count"] = parameterCount
 
 	return primary, nil
 }

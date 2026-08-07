@@ -3605,3 +3605,205 @@ func fakeRunningCmd() *exec.Cmd {
 	// SIGKILL children when the test process exits.
 	return cmd
 }
+
+// TestPredictServerVRAMSplitModel checks that a split GGUF is sized from every
+// shard. Only the first shard is passed around as the model path, and for a
+// model whose first shard holds just metadata that is a tiny fraction of the
+// real weights.
+func TestPredictServerVRAMSplitModel(t *testing.T) {
+	dir := t.TempDir()
+
+	const count = 3
+	// A metadata-only first shard, as produced by llama.cpp's gguf-split.
+	kv := ggml.KV{
+		"general.architecture":          "llama",
+		"tokenizer.ggml.tokens":         []string{" "},
+		"llama.block_count":             uint32(1),
+		"llama.embedding_length":        uint32(64),
+		"llama.attention.head_count":    uint32(1),
+		"llama.attention.head_count_kv": uint32(1),
+	}
+
+	first := filepath.Join(dir, fmt.Sprintf("model-%05d-of-%05d.gguf", 1, count))
+	w, err := os.Create(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ggml.WriteGGUF(w, kv, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	// The remaining shards carry the bulk of the weights.
+	const shardSize = 8 << 20
+	for i := 2; i <= count; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("model-%05d-of-%05d.gguf", i, count))
+		if err := os.WriteFile(name, make([]byte, shardSize), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r, err := os.Open(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	f, err := ggml.Decode(r, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	firstInfo, err := os.Stat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := PredictServerVRAM(first, f, 128)
+	if got < uint64(shardSize)*(count-1) {
+		t.Fatalf("PredictServerVRAM = %d, want at least the %d bytes held by the trailing shards", got, shardSize*(count-1))
+	}
+	// Sizing from the first shard alone would miss almost all of the weights.
+	if got <= uint64(firstInfo.Size())*count {
+		t.Fatalf("PredictServerVRAM = %d looks like it sized from the first shard only", got)
+	}
+}
+
+// TestPredictServerVRAMUsesModelHeadDims checks that the KV cache estimate
+// honours attention.key_length/value_length. Architectures with compressed
+// attention size these independently of embedding_length/head_count, and
+// deriving them understates the cache several-fold.
+func TestPredictServerVRAMUsesModelHeadDims(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+
+	const (
+		layers  = 43
+		ctx     = 16384
+		keyLen  = 512
+		valLen  = 512
+		kvHeads = 1
+	)
+
+	w, err := os.Create(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ggml.WriteGGUF(w, ggml.KV{
+		"general.architecture":              "deepseek4",
+		"tokenizer.ggml.tokens":             []string{" "},
+		"deepseek4.block_count":             uint32(layers),
+		"deepseek4.embedding_length":        uint32(4096),
+		"deepseek4.attention.head_count":    uint32(64),
+		"deepseek4.attention.head_count_kv": uint32(kvHeads),
+		"deepseek4.attention.key_length":    uint32(keyLen),
+		"deepseek4.attention.value_length":  uint32(valLen),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	r, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	f, err := ggml.Decode(r, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The prediction defers to the shared estimator, which knows this
+	// architecture's decoupled MLA head dims. Deriving them from
+	// embedding_length/head_count instead would understate the cache severalfold.
+	kvPerLayer, _, _ := f.GraphSize(ctx, 0, 1, "", ml.FlashAttentionDisabled)
+	var wantKV uint64
+	for _, layer := range kvPerLayer {
+		wantKV += layer
+	}
+	if wantKV == 0 {
+		t.Fatal("estimator returned no kv cache; the test model is not being read")
+	}
+
+	want := uint64(info.Size()) + wantKV
+	if got := PredictServerVRAM(modelPath, f, ctx); got != want {
+		t.Fatalf("PredictServerVRAM = %d, want %d", got, want)
+	}
+
+	derivedKV := uint64(layers) * kvHeads * (64 + 64) * ctx * 2
+	if wantKV <= derivedKV {
+		t.Fatalf("test does not distinguish the head dims: %d vs %d", wantKV, derivedKV)
+	}
+}
+
+func TestPredictServerVRAMQuantizedKVCache(t *testing.T) {
+	dir := t.TempDir()
+	modelPath := filepath.Join(dir, "model.gguf")
+
+	const (
+		layers  = 36
+		ctx     = 131072
+		keyLen  = 64
+		valLen  = 64
+		kvHeads = 8
+	)
+
+	w, err := os.Create(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ggml.WriteGGUF(w, ggml.KV{
+		"general.architecture":            "gpt-oss",
+		"tokenizer.ggml.tokens":           []string{" "},
+		"gpt-oss.block_count":             uint32(layers),
+		"gpt-oss.embedding_length":        uint32(2880),
+		"gpt-oss.attention.head_count":    uint32(64),
+		"gpt-oss.attention.head_count_kv": uint32(kvHeads),
+		"gpt-oss.attention.key_length":    uint32(keyLen),
+		"gpt-oss.attention.value_length":  uint32(valLen),
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+
+	r, err := os.Open(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	f, err := ggml.Decode(r, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(modelPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A quantized cache holds roughly half of what f16 does. Billing it as f16
+	// overstates the model by gigabytes at long contexts, which is enough to
+	// push it past the single-device fit threshold in the scheduler and spread
+	// it across machines it did not need.
+	t.Setenv("OLLAMA_KV_CACHE_TYPE", "q8_0")
+	gotQuantized := PredictServerVRAM(modelPath, f, ctx)
+
+	t.Setenv("OLLAMA_KV_CACHE_TYPE", "")
+	gotF16 := PredictServerVRAM(modelPath, f, ctx)
+
+	if gotQuantized >= gotF16 {
+		t.Fatalf("quantized cache should predict less than f16: q8_0 = %d, f16 = %d", gotQuantized, gotF16)
+	}
+
+	// The flat layers*heads*dim*context*2 estimate this replaced ignored that
+	// gpt-oss alternates full-context and sliding-window layers, so it came out
+	// several times over the real usage.
+	flat := uint64(layers) * kvHeads * (keyLen + valLen) * ctx * 2
+	if kv := gotF16 - uint64(info.Size()); kv >= flat {
+		t.Fatalf("estimate did not account for sliding-window layers: %d vs flat %d", kv, flat)
+	}
+}

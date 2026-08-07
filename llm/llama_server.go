@@ -45,6 +45,7 @@ import (
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/fs/ggml"
 	"github.com/ollama/ollama/ml"
+	"github.com/ollama/ollama/parser"
 )
 
 var grammarJSON = `
@@ -944,7 +945,7 @@ func NewLlamaServerRunner(
 		gpus:         slices.Clone(gpus),
 		gpuLibs:      slices.Clone(gpuLibs),
 		extraEnvs:    cloneStringMap(serverEnvs),
-		rpcServers:  rpcServers,
+		rpcServers:   rpcServers,
 	}
 
 	s := &llamaServerRunner{
@@ -2650,27 +2651,70 @@ func (s *llamaServerRunner) MemorySize() (total, vram uint64) {
 }
 
 // PredictServerVRAM estimates VRAM usage for a model without spawning llama-server.
-// Uses model file size as a proxy for weights plus a rough KV cache estimate.
+// Uses model file size as a proxy for weights plus the KV cache estimate.
 // This is intentionally conservative — it overestimates to avoid VRAM contention.
 func PredictServerVRAM(modelPath string, f *ggml.GGML, numCtx int) uint64 {
-	var weights uint64
-	if info, err := os.Stat(modelPath); err == nil {
-		weights = uint64(info.Size())
+	weights := modelFileSize(modelPath)
+
+	// Size the cache with the shared estimator rather than a formula local to
+	// this file: it knows the per-architecture layouts (sliding-window layers
+	// that hold only a small window, DeepSeek's decoupled MLA head dims) and
+	// the width of a quantized cache element. A flat
+	// layers*heads*dim*context*2 estimate is several times too large for those
+	// models, which is enough to push one past the single-GPU fit threshold in
+	// the scheduler and spread it over machines it did not need.
+	return weights + predictKVCache(f, numCtx)
+}
+
+// predictKVCache sums the per-layer KV cache estimate. GraphSize reads the
+// vocabulary with an unchecked type assertion, so a model without one — which
+// this package cannot rule out, since it is handed whatever the manifest points
+// at — would panic the scheduler. Fall back to no cache estimate in that case
+// rather than taking down the load path; the weights still dominate.
+func predictKVCache(f *ggml.GGML, numCtx int) (kvCache uint64) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("could not estimate kv cache size", "error", r)
+			kvCache = 0
+		}
+	}()
+
+	// Only the per-layer cache sizes are used here; the batch and flash
+	// attention arguments feed the graph estimates, which this prediction does
+	// not cover.
+	kvPerLayer, _, _ := f.GraphSize(uint64(numCtx), 0, 1, envconfig.KvCacheType(), LlamaServerFlashAttention(nil))
+	for _, layer := range kvPerLayer {
+		kvCache += layer
+	}
+	return kvCache
+}
+
+// modelFileSize returns the on-disk size of a model, following split GGUFs to
+// include every shard. Only the first shard is passed around as the model
+// path, so sizing from it alone would account for a fraction of the weights.
+func modelFileSize(modelPath string) uint64 {
+	info, err := os.Stat(modelPath)
+	if err != nil {
+		return 0
 	}
 
-	// KV cache: 2 (K+V) * layers * kv_heads * head_dim * context * 2 bytes (f16)
-	layers := f.KV().BlockCount()
-	kvHeads := f.KV().HeadCountKVMin()
-	if kvHeads == 0 {
-		kvHeads = 1
+	base, _, count, ok := parser.ParseShardName(filepath.Base(modelPath))
+	if !ok {
+		return uint64(info.Size())
 	}
-	headDim := uint64(0)
-	if f.KV().HeadCountMax() > 0 {
-		headDim = f.KV().EmbeddingLength() / f.KV().HeadCountMax()
-	}
-	kvCache := 2 * layers * kvHeads * headDim * uint64(numCtx) * 2
 
-	return weights + kvCache
+	dir := filepath.Dir(modelPath)
+	var total uint64
+	for i := 1; i <= count; i++ {
+		shardInfo, err := os.Stat(filepath.Join(dir, parser.ShardName(base, i, count)))
+		if err != nil {
+			// Fall back to the whole-set estimate rather than reporting a
+			// partial total, which would understate the requirement.
+			return uint64(info.Size()) * uint64(count)
+		}
+		total += uint64(shardInfo.Size())
+	}
+	return total
 }
 
 // memoryParsingWriter wraps an io.Writer and parses llama-server log output
