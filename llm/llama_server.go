@@ -390,18 +390,14 @@ func startLlamaServer(launch llamaServerLaunchConfig, out io.Writer) (cmd *exec.
 		params = append(params, "--lora", adapter)
 	}
 
-	// RPC: pass remote server endpoints and force mmap so weights stream to
-	// remote GPUs rather than being pinned in local RAM.
+	// RPC: pass remote server endpoints. mmap must stay on so weights stream to
+	// remote GPUs rather than being pinned in local RAM, so skip the load-mode
+	// overrides entirely — both "dio" and "none" would bypass mmap.
 	if launch.rpcServers != "" {
 		params = append(params, "--rpc", launch.rpcServers)
-		if launch.opts.UseMMap == nil || !*launch.opts.UseMMap {
-			// mmap must be on for RPC — override any explicit false or unset
-			t := true
-			launch.opts.UseMMap = &t
-		}
+	} else {
+		params = appendLoadModeArgs(params, launch.opts, launch.gpus)
 	}
-
-	params = appendLoadModeArgs(params, launch.opts, launch.gpus)
 
 	// KV cache type
 	if launch.kvCacheType != "" {
