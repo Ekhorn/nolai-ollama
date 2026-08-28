@@ -2,6 +2,8 @@
 
 package integration
 
+import "testing"
+
 var (
 	releaseUnicodeInputModel    = integrationModel{Name: "deepseek-coder-v2:16b-lite-instruct-q2_K", MinVRAMGB: 12}
 	releaseUnicodeOutputModel   = "gemma2:2b"
@@ -53,6 +55,7 @@ var (
 		"gemma4",
 		"gpt-oss:20b",
 		"qwen3.6:27b",
+		"qwen3.8:27b",
 	}
 	releaseAudioModels = []string{
 		"nemotron3:33b",
@@ -62,6 +65,10 @@ var (
 )
 
 const releaseSplitBatchVisionModel = "qwen3.5:2b"
+
+func TestStructuredOutput(t *testing.T) {
+	runIntegrationGroup(t, "structured-output")
+}
 
 func init() {
 	// Fixed release regression cases
@@ -118,6 +125,7 @@ func init() {
 		integrationTestCase("create-gguf", "", runCreateGGUF),
 		integrationTestCase("quantization", "qwen2.5:0.5b-instruct-fp16", runQuantization),
 	)
+	registerStructuredOutputCases()
 
 	// Model-parametric cases
 	registerModelMinVRAM([]integrationModel{releaseUnicodeInputModel, releaseParallelHistoryModel})
@@ -126,6 +134,7 @@ func init() {
 	registerEmbeddingCases(testModels(releaseEmbedModels))
 	registerVisionTextCases(testModels(releaseVisionTextModels))
 	registerToolCases(testModels(releaseToolsModels))
+	registerToolRouteCases(testModels(releaseToolsModels))
 	registerToolStressCases(testModels(releaseToolsModels))
 	registerVisionOCRDocumentCases(testModels(releaseVisionModels))
 	registerAudioTranscriptionCases(testModels(releaseAudioModels))

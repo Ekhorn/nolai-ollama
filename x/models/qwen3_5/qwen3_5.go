@@ -479,29 +479,21 @@ func stackAndClone(parts []*mlx.Array) *mlx.Array {
 	if len(parts) == 0 {
 		return nil
 	}
-	stacked := mlx.Stack(parts, 0)
-	cloned := stacked.Clone()
-	mlx.Eval(cloned)
-	return cloned
+	return mlx.Stack(parts, 0).Clone()
 }
 
 func transposeExpertWeightForGatherMM(w *mlx.Array) *mlx.Array {
 	if w == nil || !w.Valid() || w.NumDims() != 3 {
 		return w
 	}
-	t := mlx.Transpose(w, 0, 2, 1)
-	cloned := t.Clone()
-	mlx.Eval(cloned)
-	return cloned
+	return mlx.Transpose(w, 0, 2, 1).Clone()
 }
 
 func fuseExpertStacks(a, b *mlx.Array, axis int) *mlx.Array {
 	if a == nil || !a.Valid() || b == nil || !b.Valid() {
 		return nil
 	}
-	out := mlx.Concatenate([]*mlx.Array{a, b}, axis).Clone()
-	mlx.Eval(out)
-	return out
+	return mlx.Concatenate([]*mlx.Array{a, b}, axis).Clone()
 }
 
 // fuseGateUpProjections joins gate and up stacks along the output dimension,
@@ -796,10 +788,10 @@ func sanitizeConvWeight(w *mlx.Array) *mlx.Array {
 	}
 	if w.NumDims() == 3 {
 		if w.Dim(1) == 1 {
-			return mlx.Squeeze(w, 1)
+			return mlx.Reshape(w, int32(w.Dim(0)), int32(w.Dim(2)))
 		}
 		if w.Dim(2) == 1 {
-			return mlx.Squeeze(w, 2)
+			return mlx.Reshape(w, int32(w.Dim(0)), int32(w.Dim(1)))
 		}
 	}
 	return w

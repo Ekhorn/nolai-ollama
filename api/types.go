@@ -801,8 +801,18 @@ type ListResponse struct {
 
 // ModelRecommendationsResponse is the response from [Client.ModelRecommendationsExperimental].
 type ModelRecommendationsResponse struct {
-	Recommendations []ModelRecommendation `json:"recommendations"`
+	Recommendations []ModelRecommendation        `json:"recommendations"`
+	Mappings        *ModelRecommendationMappings `json:"mappings,omitempty"`
 }
+
+// ModelRecommendationMapping defines one app-specific route preference.
+type ModelRecommendationMapping struct {
+	Model        string `json:"model"`
+	RequiredPlan string `json:"required_plan,omitempty"`
+}
+
+// ModelRecommendationMappings defines the app-specific model routes.
+type ModelRecommendationMappings map[string]ModelRecommendationMapping
 
 // ModelRecommendation is a single recommendation entry in [ModelRecommendationsResponse].
 type ModelRecommendation struct {
@@ -1106,7 +1116,7 @@ func DefaultOptions() Options {
 		TopP:             0.9,
 		TypicalP:         1.0,
 		RepeatLastN:      64,
-		RepeatPenalty:    1.1,
+		RepeatPenalty:    1.0,
 		PresencePenalty:  0.0,
 		FrequencyPenalty: 0.0,
 		Seed:             -1,
