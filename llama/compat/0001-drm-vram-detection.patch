@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index e779a9b..4188800 100644
+index e73a7b8..85c9568 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -4927,78 +4927,73 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t
+@@ -4548,78 +4548,73 @@ static const char * ggml_backend_cuda_device_get_description(ggml_backend_dev_t
  }
  
  #if defined(__linux__)
@@ -137,9 +137,9 @@ index e779a9b..4188800 100644
  }
  #endif // defined(__linux__)
  
-@@ -5012,25 +5007,17 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
-     ggml_cuda_set_device(ctx->device);
-     CUDA_CHECK(cudaMemGetInfo(free, total));
+@@ -4635,25 +4630,17 @@ static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t *
+         return;
+     }
  
 -// ref: https://github.com/ggml-org/llama.cpp/pull/17368
 +// Use DRM sysfs for accurate VRAM (+GTT for iGPUs) on Linux AMD GPUs.
@@ -147,7 +147,7 @@ index e779a9b..4188800 100644
  #if defined(__linux__)
 -    // Check if this is a UMA (Unified Memory Architecture) system
 -    cudaDeviceProp prop;
--    CUDA_CHECK(cudaGetDeviceProperties(&prop, ctx->device));
+-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
 -
 -    // Check if UMA is explicitly enabled via environment variable
 -    bool uma_env = getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr;
@@ -164,7 +164,7 @@ index e779a9b..4188800 100644
 -            GGML_LOG_ERROR("%s: /proc/meminfo reading failed, using cudaMemGetInfo\n", __func__);
 +    if (!ctx->pci_bus_id.empty()) {
 +        cudaDeviceProp prop;
-+        CUDA_CHECK(cudaGetDeviceProperties(&prop, ctx->device));
++        CUDA_CHECK(cudaGetDeviceProperties(&prop, ggml_cuda_get_physical_device(ctx->device)));
 +        bool is_integrated = prop.integrated > 0;
 +        size_t drm_free = 0, drm_total = 0;
 +        if (ggml_backend_cuda_get_drm_memory(ctx->pci_bus_id, is_integrated, &drm_free, &drm_total)) {
