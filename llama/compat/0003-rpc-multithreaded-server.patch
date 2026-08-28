@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
-index d380577..7dd0ef2 100644
+index 17e999b..417a755 100644
 --- a/ggml/src/ggml-rpc/ggml-rpc.cpp
 +++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
 @@ -11,6 +11,7 @@
@@ -10,7 +10,7 @@ index d380577..7dd0ef2 100644
  #include <unordered_map>
  #include <unordered_set>
  #include <cstring>
-@@ -83,11 +84,13 @@ struct rpc_msg_hello_req {
+@@ -84,11 +85,13 @@ struct rpc_msg_hello_req {
      uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
  };
  
@@ -25,7 +25,7 @@ index d380577..7dd0ef2 100644
      uint8_t conn_caps[RPC_CONN_CAPS_SIZE];
  };
  
-@@ -324,10 +327,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+@@ -335,10 +338,14 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
  
  // RPC client-side implementation
  
@@ -41,7 +41,7 @@ index d380577..7dd0ef2 100644
      rpc_msg_hello_req request = {};
      rpc_msg_hello_rsp response = {};
  
-@@ -343,6 +350,11 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+@@ -354,6 +361,11 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
      }
  
      sock->update_caps(response.conn_caps);
@@ -53,7 +53,7 @@ index d380577..7dd0ef2 100644
      return true;
  }
  
-@@ -371,7 +383,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
+@@ -389,7 +401,7 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
      if (sock == nullptr) {
          return nullptr;
      }
@@ -62,7 +62,7 @@ index d380577..7dd0ef2 100644
          return nullptr;
      }
      LOG_DBG("[%s] connected to %s\n", __func__, endpoint.c_str());
-@@ -465,7 +477,15 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
+@@ -508,7 +520,15 @@ static void ggml_backend_rpc_buffer_memset_tensor(
  static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
      ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
      rpc_tensor rpc_tensor = serialize_tensor(tensor);
@@ -79,7 +79,7 @@ index d380577..7dd0ef2 100644
          rpc_msg_set_tensor_hash_req request;
          request.tensor = rpc_tensor;
          request.offset = offset;
-@@ -478,13 +498,17 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
+@@ -521,13 +541,20 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
              return;
          }
      }
@@ -100,11 +100,14 @@ index d380577..7dd0ef2 100644
 +        ctx->sock->send_data_more(&total_size,  sizeof(total_size)) &&
 +        ctx->sock->send_data_more(&rpc_tensor,  sizeof(rpc_tensor)) &&
 +        ctx->sock->send_data_more(&offset64,    sizeof(offset64))   &&
-+        ctx->sock->send_data(data, size);
++        ctx->sock->send_data(data, size)                            &&
++        // Message boundary: required so the RDMA transport posts its trailing
++        // partial frame. No-op on TCP.
++        ctx->sock->flush();
      RPC_STATUS_ASSERT(status);
  }
  
-@@ -866,6 +890,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+@@ -915,6 +942,7 @@ void rpc_server::hello(rpc_msg_hello_rsp & response) {
      response.major = RPC_PROTO_MAJOR_VERSION;
      response.minor = RPC_PROTO_MINOR_VERSION;
      response.patch = RPC_PROTO_PATCH_VERSION;
@@ -112,7 +115,7 @@ index d380577..7dd0ef2 100644
      LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
  }
  
-@@ -1755,9 +1780,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+@@ -1867,9 +1895,11 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
          }
          printf("Accepted client connection\n");
          fflush(stdout);
@@ -128,22 +131,29 @@ index d380577..7dd0ef2 100644
      rpc_transport_shutdown();
      for (auto backend : backends) {
 diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
-index a728152..10ff16c 100644
+index 5ec15dc..e977cfe 100644
 --- a/ggml/src/ggml-rpc/transport.cpp
 +++ b/ggml/src/ggml-rpc/transport.cpp
-@@ -117,6 +117,7 @@ struct socket_t::impl {
+@@ -125,6 +125,7 @@ struct socket_t::impl {
      impl(sockfd_t fd) : use_rdma(false), fd(fd) {}
      ~impl();
      bool send_data(const void * data, size_t size);
 +    bool send_data_more(const void * data, size_t size);
      bool recv_data(void * data, size_t size);
+     bool flush();
      void get_caps(uint8_t * local_caps);
-     void update_caps(const uint8_t * remote_caps);
-@@ -479,6 +480,25 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
+@@ -501,6 +502,32 @@ bool socket_t::impl::send_data(const void * data, size_t size) {
      return true;
  }
  
 +bool socket_t::impl::send_data_more(const void * data, size_t size) {
++#if defined(GGML_RPC_RDMA) || defined(GGML_RPC_RDMA_APPLE)
++    // MSG_MORE is a TCP socket hint. RDMA does its own framing and is flushed
++    // via flush(), so defer to send_data rather than writing to the raw fd.
++    if (use_rdma) {
++        return send_data(data, size);
++    }
++#endif
 +#if defined(MSG_MORE)
 +    size_t bytes_sent = 0;
 +    while (bytes_sent < size) {
@@ -163,9 +173,9 @@ index a728152..10ff16c 100644
 +}
 +
  bool socket_t::impl::recv_data(void * data, size_t size) {
- #ifdef GGML_RPC_RDMA
+ #ifdef GGML_RPC_RDMA_APPLE
      if (use_rdma) {
-@@ -552,6 +572,10 @@ bool socket_t::send_data(const void * data, size_t size) {
+@@ -604,6 +631,10 @@ bool socket_t::send_data(const void * data, size_t size) {
      return pimpl->send_data(data, size);
  }
  
@@ -176,7 +186,7 @@ index a728152..10ff16c 100644
  bool socket_t::recv_data(void * data, size_t size) {
      return pimpl->recv_data(data, size);
  }
-@@ -618,7 +642,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
+@@ -674,7 +705,7 @@ socket_ptr socket_t::create_server(const char * host, int port) {
      if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
          return nullptr;
      }
@@ -186,14 +196,16 @@ index a728152..10ff16c 100644
      }
      return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
 diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
-index 73b85cc..edb8702 100644
+index 3f747ec..d25b896 100644
 --- a/ggml/src/ggml-rpc/transport.h
 +++ b/ggml/src/ggml-rpc/transport.h
-@@ -14,6 +14,7 @@ struct socket_t {
+@@ -14,6 +14,9 @@ struct socket_t {
      ~socket_t();
  
      bool send_data(const void * data, size_t size);
++    // Like send_data, but hints that more data belonging to the same message
++    // follows, so the kernel should not emit a short packet yet (TCP MSG_MORE).
 +    bool send_data_more(const void * data, size_t size);
      bool recv_data(void * data, size_t size);
- 
-     socket_ptr accept();
+     // Must be called at every message boundary: the RDMA transport coalesces
+     // writes into fixed-size frames and posts the trailing partial frame only
