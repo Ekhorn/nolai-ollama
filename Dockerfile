@@ -125,11 +125,18 @@ COPY --from=llama-server-cuda_v13 dist/lib/ollama /lib/ollama/
 
 FROM rocm-7-deps AS llama-server-rocm_v7_2
 ENV CC=clang CXX=clang++ CXXFLAGS=--gcc-toolchain=/opt/rh/gcc-toolset-13/root/usr
+# Semicolon separated list, e.g. "gfx1151". When empty the preset's full
+# architecture list is built, which takes many hours on a CI runner.
+ARG AMDGPU_TARGETS
 COPY LLAMA_CPP_VERSION .
 COPY llama/server llama/server
 COPY llama/compat llama/compat
 RUN --mount=type=cache,target=/root/.ccache \
-    cmake -S llama/server --preset rocm_v7_2_linux \
+    if [ -n "$AMDGPU_TARGETS" ]; then \
+        cmake -S llama/server --preset rocm_v7_2_user_arch -DAMDGPU_TARGETS="$AMDGPU_TARGETS"; \
+    else \
+        cmake -S llama/server --preset rocm_v7_2_linux; \
+    fi \
         && cmake --build build/llama-server-rocm_v7_2 -- -l $(nproc) \
         && cmake --install build/llama-server-rocm_v7_2 --component llama-server --strip
 RUN rm -f dist/lib/ollama/rocm_v7_2/rocblas/library/*gfx90[06]*

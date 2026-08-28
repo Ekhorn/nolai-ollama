@@ -10,9 +10,9 @@ on:
         required: true
         default: 'gfx1151'
       rocm_version:
-        description: 'ROCm Version'
+        description: 'ROCm Version (must match the rocm_v7_2 preset)'
         required: true
-        default: '7.0.2'
+        default: '7.2.1'
       push_to_registry:
         description: 'Push to GHCR?'
         type: boolean
@@ -80,14 +80,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Target lists are semicolon separated and may contain ':' (e.g.
+      # "gfx90a:xnack-"), neither of which is legal in a Docker tag.
+      - name: Slugify GPU targets for tagging
+        id: arch
+        run: echo "slug=$(echo '${{ inputs.gpu_targets }}' | tr ';:' '__')" >>$GITHUB_OUTPUT
+
       - name: Extract metadata (tags, labels) for Docker
         id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             # Tag as :rocm7-gfx1151
-            type=raw,value=rocm7-${{ inputs.gpu_targets }}
+            type=raw,value=rocm7-${{ steps.arch.outputs.slug }}
             # Tag as :framework-latest
             type=raw,value=framework-latest
 
@@ -100,13 +106,12 @@ jobs:
           push: ${{ inputs.push_to_registry }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Mapping the Build Args you provided
+          # These names must match the ARGs declared in the Dockerfile.
           build-args: |
-            ROCM7VERSION=${{ inputs.rocm_version }}
+            ROCMVERSION=${{ inputs.rocm_version }}
             AMDGPU_TARGETS=${{ inputs.gpu_targets }}
             GOFLAGS=${{ needs.setup-environment.outputs.GOFLAGS }}
             CGO_CFLAGS=-O3
             CGO_CXXFLAGS=-O3
-            PARALLEL=4
           cache-from: type=gha
           cache-to: type=gha,mode=max
