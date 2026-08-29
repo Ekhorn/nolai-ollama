@@ -31,21 +31,37 @@ jobs:
     outputs:
       GOFLAGS: ${{ steps.goflags.outputs.GOFLAGS }}
       VERSION: ${{ steps.goflags.outputs.VERSION }}
+      OLLAMA_VERSION: ${{ steps.goflags.outputs.OLLAMA_VERSION }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Full history: the upstream version is read from the merge commit.
           fetch-depth: 0
       - name: Set environment
         id: goflags
         run: |
-          # If triggered manually, we might not be on a tag. Default to sha if needed.
-          VERSION=${GITHUB_REF_NAME#v}
+          # Derive the upstream ollama version from the most recent
+          # "Merge tag 'vX.Y.Z'" commit rather than the branch name, which is
+          # only incidentally related. Handles both the bare and the
+          # refs/tags/ spelling. Falls back to the branch name.
+          OLLAMA_VERSION=$(git log --grep="^Merge tag " -1 --format=%s \
+            | sed -n "s|^Merge tag '\(refs/tags/\)\?v\([0-9][^']*\)'.*|\2|p")
+          if [ -z "$OLLAMA_VERSION" ]; then
+            echo "No upstream merge commit found; falling back to ref name" >&2
+            OLLAMA_VERSION=${GITHUB_REF_NAME#v}
+          fi
+
+          # The binary reports the upstream version plus the fork's commit, so
+          # `ollama -v` distinguishes rebuilds of the same upstream release.
+          VERSION="$OLLAMA_VERSION"
           if [ "${{ github.ref_type }}" != "tag" ]; then
             VERSION="${VERSION}-$(git rev-parse --short HEAD)"
           fi
-          
+
+          echo "Resolved upstream version: $OLLAMA_VERSION (build version: $VERSION)"
           echo GOFLAGS="'-ldflags=-w -s \"-X=github.com/ollama/ollama/version.Version=${VERSION}\" \"-X=github.com/ollama/ollama/server.mode=release\"'" >>$GITHUB_OUTPUT
           echo VERSION="${VERSION}" >>$GITHUB_OUTPUT
+          echo OLLAMA_VERSION="${OLLAMA_VERSION}" >>$GITHUB_OUTPUT
 
   # 2. The Heavy Docker Build
   build-framework-image:
@@ -103,22 +119,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Target lists are semicolon separated and may contain ':' (e.g.
-      # "gfx90a:xnack-"), neither of which is legal in a Docker tag.
-      - name: Slugify GPU targets for tagging
-        id: arch
-        run: echo "slug=$(echo '${{ inputs.gpu_targets }}' | tr ';:' '__')" >>$GITHUB_OUTPUT
-
       - name: Extract metadata (tags, labels) for Docker
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # Tag as :rocm7-gfx1151
-            type=raw,value=rocm7-${{ steps.arch.outputs.slug }}
-            # Tag as :framework-latest
-            type=raw,value=framework-latest
+            # e.g. :0.33.2 — the upstream ollama release this image was built from
+            type=raw,value=${{ needs.setup-environment.outputs.OLLAMA_VERSION }}
+            type=raw,value=latest
 
       - name: Build and push Docker image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
